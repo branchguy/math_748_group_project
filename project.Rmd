@@ -1,0 +1,30 @@
+---
+title: "Supply Chain Risk and Profitability Analysis"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Introduction
+
+## Objective
+In modern supply chain management, late deliveries and unprofitable orders represent major operational losses. In technology companies an executive report stipulates that technology companies lose on average $1 million per logistics disruption/incident. This then leads to customer complaints, lost business and contracts. When supply chain disruptions occur on a large scale, restocking delays and high storage costs can lead to stockouts especially for goods intensive for delayed inputs. This project aims to analyze the extent at which both issues arise by building predictive models on historical logistics data. We will pursue and research these two primary learning tasks:
+
+1. Classification (Supervised): Determine what predictors influence whether a shipment is at risk of delayed delivery (the binary target variable "Late_delivery_risk").
+2. Regression (Supervised): Forecast the exact profit margin of an order ("Benefit per order") based on checkout-time transaction details.
+
+```{r setupkaggle, include=FALSE, echo=FALSE}
+install.packages("RKaggle")
+library(RKaggle)
+library(dplyr)
+library(purrr)
+```
+
+
+```{r dataset}
+dataset <- get_dataset("shiyalkishan01/supply-chain-intelligence-risk-analytics")
+summary(dataset)
+```
+
+## EDA
+
