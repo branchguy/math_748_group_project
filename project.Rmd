@@ -17,14 +17,49 @@ In modern supply chain management, late deliveries and unprofitable orders repre
 install.packages("RKaggle")
 library(RKaggle)
 library(dplyr)
+library(zeallot)
 library(purrr)
 ```
 
+To get RKaggle to pull dataset automatically:
+1. Go to "Your API Tokens" on Kaggle.com and hit generate
+2. Copy + put api-key generated on website into `~/.kaggle/kaggle.json`
+3. Make sure RSession is restarted
+4. Then run cell
+
 
 ```{r dataset}
-dataset <- get_dataset("shiyalkishan01/supply-chain-intelligence-risk-analytics")
-summary(dataset)
+# Get dataset and download once
+if (exists("dataset")==0) {
+  c(dataset, descriptions, data_staleness_log) %<-%   get_dataset("shashwatwork/dataco-smart-supply-chain-for-big-data-analysis")
+}
 ```
 
+
+```{r summary, echo=FALSE} 
+summary(dataset)
+```
+Dataset has a size of 180k rows and 53 features but only about 45 are useful (customer email, fname, lname and street are not super useful) and 2 are predictor variables
+
+```{r size}
+
+targets = c("Late_delivery_risk", "Benefit per order")
+not_useful = c("Customer Email", "Customer Password", "Customer Street", "Customer Fname", "Customer Lname")
+
+dataset %>% dim()
+dataset %>% names()
+dataset %>% str()
+```
+Late_delivery_risk: "Categorical variable that indicates if sending is late (1), it is not late (0)."
+
+Benefit per order: "Earnings per order placed"
+
+**Candidate Predictors** would be Sales, Order Region (or some location for order), Product Category ID, Product Price, Customer Region (or some location for customer), Days for shipping (real), Shipping mode, Delivery Status, to name a few
+
+
 ## EDA
+```{r 3}
+
+
+```
 
