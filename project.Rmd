@@ -44,7 +44,6 @@ Dataset has a size of 180k rows and 53 features but only about 45 are useful (cu
 ```{r size}
 
 targets = c("Late_delivery_risk", "Benefit per order")
-not_useful = c("Customer Email", "Customer Password", "Customer Street", "Customer Fname", "Customer Lname")
 
 dataset %>% dim()
 dataset %>% names()
@@ -55,6 +54,71 @@ Late_delivery_risk: "Categorical variable that indicates if sending is late (1),
 Benefit per order: "Earnings per order placed"
 
 **Candidate Predictors** would be Sales, Order Region (or some location for order), Product Category ID, Product Price, Customer Region (or some location for customer), Days for shipping (real), Shipping mode, Delivery Status, to name a few
+
+
+Data Cleaning
+
+Step 1: Missing value
+
+```{r}
+# Report missing counts and percentages
+missing_summary <- data.frame(
+  Variable = names(dataset),
+  Missing_Count = sapply(dataset, function(x) {
+    sum(is.na(x) | trimws(as.character(x)) == "")
+  }),
+  Missing_Percent = sapply(dataset, function(x) {
+    mean(is.na(x) | trimws(as.character(x)) == "") * 100
+  })
+)
+
+missing_summary %>%
+  arrange(desc(Missing_Percent))
+```
+```{r}
+df <- dataset %>%
+  select(-any_of(c(
+    "Product Description",
+    "Order Zipcode"
+  )))
+```
+### Step 2: Duplicate:
+```{r}
+# Count exact duplicate rows
+sum(duplicated(df))
+
+# Inspect duplicate rows
+df[duplicated(df), ]
+
+# Remove exact duplicates
+df <- df %>%
+  distinct()
+```
+#### Step 3: Data Types
+```{r}
+df <- df %>%
+  mutate(
+    `Late_delivery_risk` = as.factor(Late_delivery_risk),
+    `Shipping Mode` = as.factor(`Shipping Mode`),
+    `Customer Segment` = as.factor(`Customer Segment`),
+    `Market` = as.factor(Market),
+    `Order Region` = as.factor(`Order Region`),
+    `Days for shipment (scheduled)` = as.numeric(`Days for shipment (scheduled)`),
+    `Benefit per order` = as.numeric(`Benefit per order`),
+    order_date = mdy_hm(`order date (DateOrders)`
+    )
+  )
+
+str(df)
+```
+### Step 4. Unnecessary Variables
+```{r}
+unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
+
+df_clean <- df %>%
+  select(-any_of(unnecessary_vars))
+head(df_clean)
+```
 
 
 ## EDA
