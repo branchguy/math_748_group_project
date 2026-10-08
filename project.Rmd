@@ -14,11 +14,11 @@ In modern supply chain management, late deliveries and unprofitable orders repre
 2. Regression (Supervised): Forecast the exact profit margin of an order ("Benefit per order") based on checkout-time transaction details.
 
 ```{r setupkaggle, include=FALSE, echo=FALSE}
-install.packages("RKaggle")
 library(RKaggle)
 library(dplyr)
 library(zeallot)
 library(purrr)
+library(lubridate)
 ```
 
 To get RKaggle to pull dataset automatically:
@@ -31,13 +31,15 @@ To get RKaggle to pull dataset automatically:
 ```{r dataset}
 # Get dataset and download once
 if (exists("dataset")==0) {
-  c(dataset, descriptions, data_staleness_log) %<-%   get_dataset("shashwatwork/dataco-smart-supply-chain-for-big-data-analysis")
+  c(dataset, descriptions, data_staleness_log) %<-% get_dataset("shashwatwork/dataco-smart-supply-chain-for-big-data-analysis")
 }
+
+dataset <- read.csv("DataCo_cleaned.csv")
 ```
 
 
 ```{r summary, echo=FALSE} 
-summary(dataset)
+summary(dataset_cleaned)
 ```
 Dataset has a size of 180k rows and 53 features but only about 45 are useful (customer email, fname, lname and street are not super useful) and 2 are predictor variables
 
@@ -120,10 +122,27 @@ df_clean <- df %>%
 head(df_clean)
 ```
 
+## Early Observations
+
+* Orders date between [2015,2018]
+* ~20k customers purchasing ~65k products from 563 cities from the United States and Puerto Rico
+
+```{r}
+dataset %>% 
+  mutate(year = year(order_date)) %>% 
+  count(year)
+
+paste("Distinct customers: ", dataset %>% select(Customer.Id) %>% distinct %>% count())
+paste("Distinct orders: ", dataset %>% select(Order.Id) %>% distinct %>% count())
+paste("Distinct products: ", dataset %>% select(Product.Card.Id) %>% distinct %>% count())
+paste("Distinct Customer Cities: ", dataset %>% select(Customer.City) %>% distinct %>% count())
+paste("Distinct Customer Countires: ", dataset %>% select(Customer.Country) %>% distinct %>% count())
+```
+
 
 ## EDA
 ```{r 3}
-
+dataset %>% subset() %>% as.matrix() %>% pairs(cex=0.1)
 
 ```
 
