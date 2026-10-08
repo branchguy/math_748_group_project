@@ -21,6 +21,7 @@ library(purrr)
 library(lubridate)
 library(ggplot2)
 library(tidyr)
+library(forcats)
 ```
 
 To get RKaggle to pull dataset automatically:
@@ -145,9 +146,10 @@ paste("Distinct Customer Countires: ", df_clean %>% select(`Customer Country`) %
 
 ## EDA
 ```{r 3}
-top_ten <- c("`Days for shipment (scheduled)`","`Sales per customer`", "Latitude", "Longitude", "`Order Item Discount`", 
-  "`Order Item Discount Rate`", "`Order Item Product Price`", "`Order Item Profit Ratio`", "`Order Item Quantity`", "`Order Item Total`")
+top_ten <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
+  "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
 
+top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer Segment", "Department Name", "Market", "Order City", "Order Country", "Order Region", "Order State", "Product Name", "Shipping Mode")
 
 # Not super informative other than showing how there's a lot of structure in the data
 # df_clean %>% 
@@ -158,9 +160,7 @@ top_ten <- c("`Days for shipment (scheduled)`","`Sales per customer`", "Latitude
 #   pairs(cex=0.1)
 
 df_clean %>% 
-  select(
-  `Days for shipment (scheduled)`,`Sales per customer`, Latitude, Longitude, `Order Item Discount`, 
-  `Order Item Discount Rate`, `Order Item Product Price`, `Order Item Profit Ratio`, `Order Item Quantity`, `Order Item Total`) %>% 
+  select(top_ten) %>% 
   pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = value)) +
   geom_histogram(bins = 20, fill = "royalblue", color = "white") +
@@ -168,6 +168,36 @@ df_clean %>%
   # 4. Create separate panels for each variable
   facet_wrap(~ variable, scales = "free")
   # theme_minimal()
+
+df_clean %>% 
+  select(top_ten_cat) %>% 
+  pivot_longer(cols = everything(), names_to= "category_name", values_to = "category_value") %>% 
+  filter(!is.na(category_value)) %>% 
+  
+  # only top 10
+  count(category_name, category_value) %>% 
+  group_by(category_name) %>% 
+  slice_max(order_by = n, n = 10, with_ties = FALSE) %>% 
+  ungroup() %>% 
+  
+  # order
+  mutate(category_value = fct_reorder(category_value, n, .desc = TRUE)) %>%
+  
+  ggplot(aes(x = category_value, y = n, fill = category_name)) +
+  geom_col(color = "white", alpha = 0.8) +
+  
+  # 4. Create separate panels for each variable
+  facet_wrap(~ category_name, scales = "free", ncol = 2)
+
+```
+
+```{r}
+df_clean %>%
+  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  ggplot(aes(x = x_value, fill = Late_delivery_risk)) +
+  geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 4) + # 10 distinct plots
+  theme_minimal()
 
 ```
 
