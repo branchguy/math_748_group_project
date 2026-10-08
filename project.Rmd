@@ -19,6 +19,8 @@ library(dplyr)
 library(zeallot)
 library(purrr)
 library(lubridate)
+library(ggplot2)
+library(tidyr)
 ```
 
 To get RKaggle to pull dataset automatically:
@@ -33,13 +35,15 @@ To get RKaggle to pull dataset automatically:
 if (exists("dataset")==0) {
   c(dataset, descriptions, data_staleness_log) %<-% get_dataset("shashwatwork/dataco-smart-supply-chain-for-big-data-analysis")
 }
+dataset <- dataset %>%
+  mutate(across(where(is.character), ~ iconv(.x, from = "ISO-8859-1", to = "UTF-8")))
 
-dataset <- read.csv("DataCo_cleaned.csv")
+# dataset <- read.csv("DataCo_cleaned.csv")
 ```
 
 
 ```{r summary, echo=FALSE} 
-summary(dataset_cleaned)
+summary(dataset)
 ```
 Dataset has a size of 180k rows and 53 features but only about 45 are useful (customer email, fname, lname and street are not super useful) and 2 are predictor variables
 
@@ -128,21 +132,42 @@ head(df_clean)
 * ~20k customers purchasing ~65k products from 563 cities from the United States and Puerto Rico
 
 ```{r}
-dataset %>% 
+df_clean %>% 
   mutate(year = year(order_date)) %>% 
   count(year)
 
-paste("Distinct customers: ", dataset %>% select(Customer.Id) %>% distinct %>% count())
-paste("Distinct orders: ", dataset %>% select(Order.Id) %>% distinct %>% count())
-paste("Distinct products: ", dataset %>% select(Product.Card.Id) %>% distinct %>% count())
-paste("Distinct Customer Cities: ", dataset %>% select(Customer.City) %>% distinct %>% count())
-paste("Distinct Customer Countires: ", dataset %>% select(Customer.Country) %>% distinct %>% count())
+paste("Distinct customers: ", df_clean %>% select(`Customer Id`) %>% distinct %>% count())
+paste("Distinct orders: ", df_clean %>% select(`Order Id`) %>% distinct %>% count())
+paste("Distinct products: ", df_clean %>% select(`Product Card Id`) %>% distinct %>% count())
+paste("Distinct Customer Cities: ", df_clean %>% select(`Customer City`) %>% distinct %>% count())
+paste("Distinct Customer Countires: ", df_clean %>% select(`Customer Country`) %>% distinct %>% count())
 ```
-
 
 ## EDA
 ```{r 3}
-dataset %>% subset() %>% as.matrix() %>% pairs(cex=0.1)
+top_ten <- c("`Days for shipment (scheduled)`","`Sales per customer`", "Latitude", "Longitude", "`Order Item Discount`", 
+  "`Order Item Discount Rate`", "`Order Item Product Price`", "`Order Item Profit Ratio`", "`Order Item Quantity`", "`Order Item Total`")
+
+
+# Not super informative other than showing how there's a lot of structure in the data
+# df_clean %>% 
+#   select(
+#   `Days for shipment (scheduled)`,`Sales per customer`, Latitude, Longitude, `Order Item Discount`, 
+#   `Order Item Discount Rate`, `Order Item Product Price`, `Order Item Profit Ratio`, `Order Item Quantity`, `Order Item Total`) %>% 
+#   as.matrix() %>% 
+#   pairs(cex=0.1)
+
+df_clean %>% 
+  select(
+  `Days for shipment (scheduled)`,`Sales per customer`, Latitude, Longitude, `Order Item Discount`, 
+  `Order Item Discount Rate`, `Order Item Product Price`, `Order Item Profit Ratio`, `Order Item Quantity`, `Order Item Total`) %>% 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 20, fill = "royalblue", color = "white") +
+  
+  # 4. Create separate panels for each variable
+  facet_wrap(~ variable, scales = "free")
+  # theme_minimal()
 
 ```
 
