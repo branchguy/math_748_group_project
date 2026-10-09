@@ -15,6 +15,7 @@ In modern supply chain management, late deliveries and unprofitable orders repre
 
 ```{r setupkaggle, include=FALSE, echo=FALSE}
 library(RKaggle)
+library(rstatix)
 library(dplyr)
 library(zeallot)
 library(purrr)
@@ -51,7 +52,6 @@ Dataset has a size of 180k rows and 53 features but only about 45 are useful (cu
 ```{r size}
 
 targets = c("Late_delivery_risk", "Benefit per order")
-
 dataset %>% dim()
 dataset %>% names()
 dataset %>% str()
@@ -142,9 +142,12 @@ paste("Distinct orders: ", df_clean %>% select(`Order Id`) %>% distinct %>% coun
 paste("Distinct products: ", df_clean %>% select(`Product Card Id`) %>% distinct %>% count())
 paste("Distinct Customer Cities: ", df_clean %>% select(`Customer City`) %>% distinct %>% count())
 paste("Distinct Customer Countires: ", df_clean %>% select(`Customer Country`) %>% distinct %>% count())
+paste("Distinct Sites: ", df_clean %>% select(Latitude, Longitude) %>% distinct %>% count())
 ```
 
-## EDA
+## EDA 
+### Late_delivery_risk
+
 ```{r 3}
 top_ten <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
@@ -158,6 +161,8 @@ top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer
 #   `Order Item Discount Rate`, `Order Item Product Price`, `Order Item Profit Ratio`, `Order Item Quantity`, `Order Item Total`) %>% 
 #   as.matrix() %>% 
 #   pairs(cex=0.1)
+# View(df_clean)
+
 
 df_clean %>% 
   select(top_ten) %>% 
@@ -166,27 +171,44 @@ df_clean %>%
   geom_histogram(bins = 20, fill = "royalblue", color = "white") +
   
   # 4. Create separate panels for each variable
-  facet_wrap(~ variable, scales = "free")
-  # theme_minimal()
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal()
 
 df_clean %>% 
-  select(top_ten_cat) %>% 
-  pivot_longer(cols = everything(), names_to= "category_name", values_to = "category_value") %>% 
-  filter(!is.na(category_value)) %>% 
-  
-  # only top 10
-  count(category_name, category_value) %>% 
-  group_by(category_name) %>% 
-  slice_max(order_by = n, n = 10, with_ties = FALSE) %>% 
-  ungroup() %>% 
-  
-  # order
-  mutate(category_value = fct_reorder(category_value, n, .desc = TRUE)) %>%
-  
-  ggplot(aes(x = category_value, y = n, fill = category_name)) +
-  geom_col(color = "white", alpha = 0.8) +
-  
+  select(`Benefit per order`) %>% 
+  pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 100, fill = "royalblue", color = "white") +
+  coord_cartesian(xlim = c(-500, 500)) +
   # 4. Create separate panels for each variable
+  facet_wrap(~ variable, scales = "free") +
+  theme_minimal()
+
+df_clean %>% 
+  ggplot(aes(x = Late_delivery_risk, fill = Late_delivery_risk)) +
+  geom_bar( fill = "royalblue", color = "white") +
+  labs(x = "Late Delivery Risk", y = "Count") +
+  geom_text(stat = "count", 
+            aes(group = 1, label = paste0(after_stat(count), " (", round(after_stat(prop), 3)*100, "%)")), vjust = -0.5, size = 4) +
+
+  # coord_cartesian(xlim = c(-500, 500)) +
+  theme_minimal()
+
+df_clean %>% 
+  select(top_ten_cat, Late_delivery_risk) %>% 
+  pivot_longer(cols = top_ten_cat, names_to = "category_name", values_to = "category_value") %>% 
+  # Count the pairs first to get the breakdown
+  count(category_name, category_value, Late_delivery_risk) %>% 
+  # Group by category to find the total volume for slicing
+  group_by(category_name, category_value) %>% 
+  mutate(total_n = sum(n)) %>% 
+  group_by(category_name) %>% 
+  # Slice based on the total category size, keeping all risk levels
+  slice_max(order_by = total_n, n = 10, with_ties = FALSE) %>% 
+  ungroup() %>% 
+  mutate(category_value = fct_reorder(category_value, n, .desc = TRUE)) %>% 
+  ggplot(aes(x = category_value, y = n, fill = Late_delivery_risk)) + 
+  geom_col(color = "white", alpha = 0.8) + 
   facet_wrap(~ category_name, scales = "free", ncol = 2)
 
 ```
@@ -199,5 +221,75 @@ df_clean %>%
   facet_wrap(~ predictor, scales = "free_x", ncol = 4) + # 10 distinct plots
   theme_minimal()
 
+```
+### Benefit per Order
+
+```{r 3}
+
+df_clean %>% 
+  select(top_ten_cat, `Benefit per order`) %>% 
+  pivot_longer(cols = top_ten_cat, names_to = "category_name", values_to = "category_value") %>% 
+  # Group by category to find the total volume for slicing
+  group_by(category_name, category_value) %>%
+  summarise(
+    n = n(),
+    avg_benefit = mean(`Benefit per order`, na.rm = TRUE),
+    total_benefit = sum(`Benefit per order`, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  group_by(category_name) %>%
+  slice_max(order_by = n, n = 10, with_ties = FALSE) %>%
+  ungroup() %>%
+  mutate(category_value = fct_reorder(category_value, avg_benefit, .desc = TRUE)) %>% 
+  ggplot(aes(x = category_value, y = n, fill = avg_benefit)) + 
+  geom_col(color = "white", alpha = 0.8) + 
+  facet_wrap(~ category_name, scales = "free", ncol = 2)
+
+
+```
+
+```{r}
+df_clean %>%
+  mutate(
+    benefit_per_order_group = cut(
+      `Benefit per order`,
+      breaks = c(-Inf, -100, 0, 100, Inf),
+      labels = c("Very Low", "Low", "High", "Very High")
+    )
+  ) %>%
+  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  ggplot(aes(x = x_value, fill = benefit_per_order_group)) +
+  geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 4) +
+  theme_minimal()
+
+```
+
+### Finding correlations
+
+```{r}
+df_clean %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
+  cor_mat
+```
+
+```{r}
+df_clean %>% filter(`Product Price` > 1000) %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
+  cor_mat
+```
+
+### Classification Regression
+
+```{r}
+
+df_clean %>% summarise(across(everything(), n_distinct))
+usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
+predictors = c(top_ten, top_ten_cat)
+safe_top_ten <- paste0("`", usable_cat, "`")
+lm.fit <- glm(reformulate(safe_top_ten, response="Late_delivery_risk"), data=df_clean, family = binomial(link = "logit"))
+summary(lm.fit)
 ```
 
