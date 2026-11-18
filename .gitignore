@@ -37,3 +37,7 @@ renv/library/
 renv/staging/
 *.Rcheck/
 .Rcheck/
+
+
+# Specific to this repo: pdf renderings of the Rmarkdown file
+project.pdf
