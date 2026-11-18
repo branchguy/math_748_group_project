@@ -1,8 +1,8 @@
 ---
 title: "Supply Chain Risk and Profitability Analysis"
-author: "Your Name"
+author: "My Cao and Liam Branch"
 date: "`r Sys.Date()`"
-output: html_document
+output: pdf_document
 ---
 
 # Introduction
@@ -26,10 +26,11 @@ library(forcats)
 ```
 
 To get RKaggle to pull dataset automatically:
-1. Go to "Your API Tokens" on Kaggle.com and hit generate
-2. Copy + put api-key generated on website into `~/.kaggle/kaggle.json`
-3. Make sure RSession is restarted
-4. Then run cell
+
+  1. Go to "Your API Tokens" on Kaggle.com and hit generate  
+  2. Copy + put api-key generated on website into `~/.kaggle/kaggle.json`  
+  3. Make sure RSession is restarted  
+  4. Then run cell  
 
 
 ```{r dataset}
@@ -67,7 +68,7 @@ Data Cleaning
 
 Step 1: Missing value
 
-```{r}
+```{r missing}
 # Report missing counts and percentages
 missing_summary <- data.frame(
   Variable = names(dataset),
@@ -82,7 +83,9 @@ missing_summary <- data.frame(
 missing_summary %>%
   arrange(desc(Missing_Percent))
 ```
-```{r}
+
+
+```{r remove}
 df <- dataset %>%
   select(-any_of(c(
     "Product Description",
@@ -90,7 +93,7 @@ df <- dataset %>%
   )))
 ```
 ### Step 2: Duplicate:
-```{r}
+```{r dups}
 # Count exact duplicate rows
 sum(duplicated(df))
 
@@ -102,7 +105,7 @@ df <- df %>%
   distinct()
 ```
 #### Step 3: Data Types
-```{r}
+```{r datatype}
 df <- df %>%
   mutate(
     `Late_delivery_risk` = as.factor(Late_delivery_risk),
@@ -119,7 +122,7 @@ df <- df %>%
 str(df)
 ```
 ### Step 4. Unnecessary Variables
-```{r}
+```{r var select}
 unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
 
 df_clean <- df %>%
@@ -132,7 +135,7 @@ head(df_clean)
 * Orders date between [2015,2018]
 * ~20k customers purchasing ~65k products from 563 cities from the United States and Puerto Rico
 
-```{r}
+```{r distinct}
 df_clean %>% 
   mutate(year = year(order_date)) %>% 
   count(year)
@@ -148,7 +151,7 @@ paste("Distinct Sites: ", df_clean %>% select(Latitude, Longitude) %>% distinct 
 ## EDA 
 ### Late_delivery_risk
 
-```{r 3}
+```{r eda}
 top_ten <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
 
@@ -213,7 +216,7 @@ df_clean %>%
 
 ```
 
-```{r}
+```{r late_hist}
 df_clean %>%
   pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
   ggplot(aes(x = x_value, fill = Late_delivery_risk)) +
@@ -248,7 +251,7 @@ df_clean %>%
 
 ```
 
-```{r}
+```{r grouped_bene}
 df_clean %>%
   mutate(
     benefit_per_order_group = cut(
@@ -267,14 +270,14 @@ df_clean %>%
 
 ### Finding correlations
 
-```{r}
+```{r late_cor}
 df_clean %>% 
   select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
   cor_mat
 ```
 
-```{r}
+```{r bene_cor}
 df_clean %>% filter(`Product Price` > 1000) %>% 
   select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
@@ -283,7 +286,7 @@ df_clean %>% filter(`Product Price` > 1000) %>%
 
 ### Classification Regression
 
-```{r}
+```{r regression}
 
 df_clean %>% summarise(across(everything(), n_distinct))
 usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
