@@ -23,6 +23,8 @@ library(lubridate)
 library(ggplot2)
 library(tidyr)
 library(forcats)
+library(caret)
+library(pROC)
 ```
 
 To get RKaggle to pull dataset automatically:
@@ -284,15 +286,160 @@ df_clean %>% filter(`Product Price` > 1000) %>%
   cor_mat
 ```
 
-### Classification Regression
+## Analysis
 
-```{r regression}
+### Validation Split
 
-df_clean %>% summarise(across(everything(), n_distinct))
-usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
-predictors = c(top_ten, top_ten_cat)
-safe_top_ten <- paste0("`", usable_cat, "`")
-lm.fit <- glm(reformulate(safe_top_ten, response="Late_delivery_risk"), data=df_clean, family = binomial(link = "logit"))
-summary(lm.fit)
+> "Approximately 75% of the observations will be used for training, while the remaining 25% of data will be reserved for testing. We also plan to use 5 Fold Cross Validation on this dataset"
+
+
+```{r validation split}
+set.seed(1)
+
+train_idx <- sample(1:nrow(df_clean), size = round(0.75 * nrow(df_clean)))
+train <- df_clean[train_idx, ]
+test <- df_clean[-train_idx, ]
 ```
+
+
+
+### Classification Regression (Method 1)
+
+added in some of the top ten numerical predictors but didn't find anything useful outside of item profit ratio which didn't help
+
+#### Response Variable: `Late_delivery_risk`
+
+```{r logistic regression late delivery risk}
+
+# inspect the number of n distinct rows for each column
+df_clean %>% summarise(across(everything(), n_distinct))
+
+# define usable categories (issues with the others)
+usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
+# all our selected predictors
+# predictors = c(top_ten, top_ten_cat)
+
+safe_top_ten_num <- paste0("`", top_ten, "`") # numerical predictors to fit on
+safe_top_ten <- paste0("`", usable_cat, "`") # categorical predictors to fit on
+top_sixteen <- c(safe_top_ten, safe_top_ten_num) # categorical + numerical predictors
+
+# fit is adjusted to just include the numerical Order Profit Ratio as the rest didn't have high p-values
+lm.fit <- glm(reformulate(c(safe_top_ten, safe_top_ten_num[8]), response="Late_delivery_risk"), data=train, family = binomial)
+summary(lm.fit)
+AIC(lm.fit)
+
+log.probs <- predict(lm.fit, newdata=test, type="response")
+log.preds <- ifelse(log.probs > 0.5, 1, 0)
+log.cm <- confusionMatrix(data=as.factor(log.preds), ref=as.factor(test$Late_delivery_risk), positive = "1")
+log.cm
+hist(log.probs)
+# calculate roc
+roc_obj <- roc(response = as.factor(test$Late_delivery_risk), predictor = log.probs)
+
+roc_curve <- function(roc_obj) {
+  # simple plot is ugly
+  # plot(roc_obj, print.auc = TRUE, main = "ROC Curve")
+  # using ggplot for ROC curve
+  ggroc(roc_obj, colour = "#2C3E50", size = 1.2, legacy.axes = TRUE) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+    annotate("text", x = 0.70, y = 0.25, 
+             label = paste("AUC =", round(auc(roc_obj),2)), 
+             size = 5, fontface = "bold", color = "#2C3E50") +
+    labs(
+      title = "ROC Curve",
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)"
+    ) +
+    coord_equal() +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+    )
+}
+
+roc_curve(roc_obj)
+# clean up memory so computer survives
+rm(lm.fit)
+```
+
+ notice that the roc curve has these kinks / segments which is indicative of the categorical model dependent on a set of categories, instead of a continuous variable --> caused by only fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
+
+#### Response Variable: `Benefit_per_order`
+
+```{r log regression benefit per order}
+lm.fit <- lm(reformulate(top_sixteen, response="`Benefit per order`"), data=train)
+summary(lm.fit)
+AIC(lm.fit)
+summary(lm.fit)$adj.r.squared # Adjusted R^2
+
+lm.preds <- predict(lm.fit, newdata=test, type="response")
+
+
+eval_benefit_per_order <- function(preds) {
+  lm.RMSE <- sqrt(mean((test$`Benefit per order` - preds)^2))
+  paste("RMSE", lm.RMSE)
+  
+  lm.MAE <- mean(abs(test$`Benefit per order` - preds))
+  paste("MAE", lm.MAE)
+  return(list(rmse=lm.RMSE, mae=lm.MAE))
+}
+# out comes list of RMSE and MAE
+lm.out <- eval_benefit_per_order(lm.preds)
+lm.out$rmse
+```
+
+the fact that RMSE and MAE are so different is because we have significant outliers (not only in the predictors but also in the Benefit per order)
+
+### Lasso Regression (Method 2)
+
+```{r lasso regression late delivery risk}
+library(glmnet)
+
+x <- model.matrix(reformulate(safe_top_ten_num, response = "`Benefit per order`"), data = df_clean)[, -1]
+y <- model.response(model.frame(reformulate(safe_top_ten_num, response = "`Benefit per order`"), data = df_clean))
+
+cv_lasso <- cv.glmnet(x, y, alpha = 1)
+plot(cv_lasso)
+# 5. View the optimal lambda values and non-zero coefficients
+best_lambda <- cv_lasso$lambda.min
+coef(cv_lasso, s = "lambda.min")
+
+ridge.pred=predict(ridge.mod,s=4,newx=x[test,])
+```
+
+
+### Boosted Random Forest (Method 3)
+
+```{r load}
+library(gbm)
+set.seed(1)
+#fit boosted regression tree
+#binary classification: distribution="bernoulli"
+#regression: distribution="gaussian"
+#more than two classes: "multinomial"
+#n.trees: number of trees (default 100)
+#interaction.depth=4 limits the depth of each tree (default 1)
+
+boosted.rf.fit <- gbm(
+  reformulate(safe_top_ten, response = "`Benefit per order`"), 
+  data=df_clean,
+  distribution="gaussian",
+  n.trees=5000,
+  interaction.depth=4)
+
+```
+
+### Logistic Cubic Spline (Method 4)
+
+```{r}
+
+```
+
+
+
+
+
+
 
