@@ -1,0 +1,608 @@
+---
+title: "Chapter 2 HW"
+author: "Tom"
+date: "Due date of Chapter 2 HW"
+output:
+  html_document:
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+  pdf_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+# DO NOT ALTER CODE IN THIS CHUNK
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+```
+
+* * *
+
+```{r}
+# ============================================================
+# DataCo: Checkout-time profit prediction
+# Multiple linear regression, Lasso, random forest, boosting
+# ============================================================
+
+# Run once if needed:
+# install.packages(c("glmnet", "ranger", "gbm"))
+
+library(glmnet)
+library(ranger)
+library(gbm)
+
+set.seed(448)
+
+input <- "D:/DataCo_cleaned.csv"
+out <- "model_results"
+
+dir.create(out, recursive = TRUE, showWarnings = FALSE)
+
+save_csv <- function(x, name) {
+  write.csv(x, file.path(out, name), row.names = FALSE)
+}
+
+# ------------------------------------------------------------
+# 1. Import data and select checkout-time predictors
+# ------------------------------------------------------------
+
+raw <- read.csv(
+  input,
+  check.names = FALSE,
+  fileEncoding = "latin1"
+)
+
+# Standardize names, including names exported with dots.
+names(raw) <- tolower(gsub("[^A-Za-z0-9]+", "_", names(raw)))
+names(raw) <- gsub("^_|_$", "", names(raw))
+
+predictors <- c(
+  "order_item_quantity",
+  "order_item_product_price",
+  "order_item_discount_rate",
+  "category_name",
+  "customer_segment",
+  "market",
+  "order_region"
+)
+
+needed <- c("order_id", "benefit_per_order", predictors)
+
+stopifnot(all(needed %in% names(raw)))
+
+# Remove only exact full-record duplicates.
+raw <- unique(raw)
+
+d <- raw[, needed]
+names(d)[1:2] <- c("order_id", "y")
+
+num <- predictors[1:3]
+catvars <- predictors[4:7]
+
+stopifnot(
+  all(vapply(d[, c("y", num)], is.numeric, logical(1)))
+)
+
+d <- d[is.finite(d$y) & !is.na(d$order_id), ]
+
+for (v in catvars) {
+  d[[v]] <- as.character(d[[v]])
+}
+
+# The whitelist excludes:
+# Order Profit Per Order: duplicates the response.
+# Order Item Profit Ratio: derived from profit.
+# Delivery Status, actual shipping days, shipping date,
+# Late_delivery_risk and Order Status: later information.
+# Identifiers and personal information are not predictors.
+
+# ------------------------------------------------------------
+# 2. Split whole orders: 75% training, 25% testing
+# ------------------------------------------------------------
+
+ids <- unique(d$order_id)
+train_ids <- sample(ids, floor(0.75 * length(ids)))
+
+train <- d[d$order_id %in% train_ids, ]
+test <- d[!d$order_id %in% train_ids, ]
+
+stopifnot(!any(train$order_id %in% test$order_id))
+
+# Assign each training order to one of five validation folds.
+fold_map <- setNames(
+  sample(rep(1:5, length.out = length(train_ids))),
+  as.character(train_ids)
+)
+
+fold_id <- unname(fold_map[as.character(train$order_id)])
+
+save_csv(
+  data.frame(
+    set = c("train", "test"),
+    rows = c(nrow(train), nrow(test)),
+    orders = c(length(train_ids), length(ids) - length(train_ids))
+  ),
+  "split_counts.csv"
+)
+
+# ------------------------------------------------------------
+# 3. Preprocessing learned within each training fold
+# ------------------------------------------------------------
+
+learn_prep <- function(a) {
+
+  med <- sapply(
+    a[, num, drop = FALSE],
+    function(z) median(z[is.finite(z)])
+  )
+
+  lev <- lapply(
+    a[, catvars, drop = FALSE],
+    function(z) sort(unique(z[!is.na(z) & nzchar(z)]))
+  )
+
+  modes <- sapply(a[, catvars, drop = FALSE], function(z) {
+    z <- z[!is.na(z) & nzchar(z)]
+    names(sort(table(z), decreasing = TRUE))[1]
+  })
+
+  stopifnot(all(is.finite(med)), all(lengths(lev) >= 2))
+
+  list(med = med, lev = lev, modes = modes)
+}
+
+apply_prep <- function(a, p) {
+
+  x <- a[, predictors, drop = FALSE]
+
+  for (v in num) {
+    x[[v]][!is.finite(x[[v]])] <- p$med[[v]]
+  }
+
+  for (v in catvars) {
+    z <- x[[v]]
+    z[is.na(z) | !z %in% p$lev[[v]]] <- p$modes[[v]]
+    x[[v]] <- factor(z, levels = p$lev[[v]])
+  }
+
+  x
+}
+
+design <- function(x) model.matrix(~ ., x)
+
+score <- function(y, pred) {
+  c(
+    RMSE = sqrt(mean((y - pred)^2)),
+    MAE = mean(abs(y - pred)),
+    R2 = 1 - sum((y - pred)^2) / sum((y - mean(y))^2)
+  )
+}
+
+# ------------------------------------------------------------
+# 4. Define tuning grids before test evaluation
+# ------------------------------------------------------------
+
+lambda <- 10^seq(2, -3, length.out = 30)
+
+rf_grid <- expand.grid(
+  mtry = c(2L, 7L),
+  min_node = c(50L, 200L)
+)
+
+gb_grid <- expand.grid(
+  depth = c(1L, 3L),
+  rate = c(0.03, 0.10)
+)
+
+tree_grid <- c(100L, 300L, 600L)
+
+cv <- data.frame()
+
+record <- function(model, config, fold, y, pred) {
+
+  s <- score(y, pred)
+
+  cv <<- rbind(
+    cv,
+    data.frame(
+      model, config, fold,
+      RMSE = s[1],
+      MAE = s[2],
+      R2 = s[3],
+      row.names = NULL
+    )
+  )
+}
+
+# ------------------------------------------------------------
+# 5. Five-fold cross-validation grouped by order
+# ------------------------------------------------------------
+
+for (k in 1:5) {
+
+  cat("CV fold", k, "of 5\n")
+
+  a <- train[fold_id != k, ]
+  b <- train[fold_id == k, ]
+
+  pp <- learn_prep(a)
+
+  xa <- apply_prep(a, pp)
+  xb <- apply_prep(b, pp)
+
+  ma <- design(xa)
+  mb <- design(xb)
+
+  # Multiple linear regression
+  ols <- lm.fit(ma, a$y)
+
+  beta <- ols$coefficients
+  beta[is.na(beta)] <- 0
+
+  # QR fitting handles redundant market/region indicators.
+  record("Linear", 1, k, b$y, drop(mb %*% beta))
+
+  # Lasso: fit a complete penalty path.
+  lasso <- glmnet(
+    ma[, -1],
+    a$y,
+    alpha = 1,
+    lambda = lambda,
+    standardize = TRUE
+  )
+
+  lp <- predict(lasso, newx = mb[, -1], s = lambda)
+
+  for (j in seq_along(lambda)) {
+    record("Lasso", j, k, b$y, lp[, j])
+  }
+
+  # Random forest
+  for (j in seq_len(nrow(rf_grid))) {
+
+    set.seed(448 + 100 * k + j)
+
+    rf <- ranger(
+      x = xa,
+      y = a$y,
+      num.trees = 300,
+      mtry = rf_grid$mtry[j],
+      min.node.size = rf_grid$min_node[j],
+      respect.unordered.factors = "order",
+      num.threads = 2
+    )
+
+    record(
+      "Random forest", j, k, b$y,
+      predict(rf, xb)$predictions
+    )
+
+    rm(rf)
+  }
+
+  # Gradient boosting
+  for (j in seq_len(nrow(gb_grid))) {
+
+    set.seed(1448 + 100 * k + j)
+
+    gb <- gbm(
+      y ~ .,
+      data = data.frame(y = a$y, xa),
+      distribution = "gaussian",
+      n.trees = max(tree_grid),
+      interaction.depth = gb_grid$depth[j],
+      shrinkage = gb_grid$rate[j],
+      n.minobsinnode = 50,
+      bag.fraction = 0.8,
+      verbose = FALSE,
+      keep.data = FALSE,
+      n.cores = 1
+    )
+
+    for (t in seq_along(tree_grid)) {
+
+      key <- (j - 1L) * length(tree_grid) + t
+
+      record(
+        "Boosting", key, k, b$y,
+        predict(gb, xb, n.trees = tree_grid[t])
+      )
+    }
+  }
+
+  gc()
+}
+
+save_csv(cv, "cv_fold_scores.csv")
+
+# ------------------------------------------------------------
+# 6. Select configurations using CV RMSE
+# ------------------------------------------------------------
+
+cv_mean <- aggregate(
+  cbind(RMSE, MAE, R2) ~ model + config,
+  cv,
+  mean
+)
+
+cv_se <- aggregate(
+  RMSE ~ model + config,
+  cv,
+  function(z) sd(z) / sqrt(length(z))
+)
+
+names(cv_se)[3] <- "RMSE_SE"
+
+cv_mean <- merge(cv_mean, cv_se, by = c("model", "config"))
+
+best <- do.call(
+  rbind,
+  lapply(split(cv_mean, cv_mean$model), function(z) {
+    z[which.min(z$RMSE), ]
+  })
+)
+
+best <- best[order(best$RMSE), ]
+rownames(best) <- NULL
+
+save_csv(cv_mean, "cv_all_configurations.csv")
+save_csv(best, "cv_best_models.csv")
+
+# Freeze the preferred method before inspecting test results.
+winner <- best$model[1]
+
+ix <- setNames(best$config, best$model)
+
+best_lambda <- lambda[ix[["Lasso"]]]
+best_rf <- rf_grid[ix[["Random forest"]], ]
+
+gkey <- ix[["Boosting"]]
+gj <- (gkey - 1L) %/% length(tree_grid) + 1L
+nt <- tree_grid[(gkey - 1L) %% length(tree_grid) + 1L]
+
+# ------------------------------------------------------------
+# 7. Refit selected configurations on all training orders
+# ------------------------------------------------------------
+
+pp <- learn_prep(train)
+
+xt <- apply_prep(train, pp)
+xe <- apply_prep(test, pp)
+
+mt <- design(xt)
+me <- design(xe)
+
+ols <- lm.fit(mt, train$y)
+
+beta <- ols$coefficients
+beta[is.na(beta)] <- 0
+
+lasso <- glmnet(
+  mt[, -1],
+  train$y,
+  alpha = 1,
+  lambda = lambda,
+  standardize = TRUE
+)
+
+set.seed(448)
+
+rf <- ranger(
+  x = xt,
+  y = train$y,
+  num.trees = 300,
+  mtry = best_rf$mtry,
+  min.node.size = best_rf$min_node,
+  respect.unordered.factors = "order",
+  importance = "permutation",
+  num.threads = 2
+)
+
+set.seed(448)
+
+gb <- gbm(
+  y ~ .,
+  data = data.frame(y = train$y, xt),
+  distribution = "gaussian",
+  n.trees = nt,
+  interaction.depth = gb_grid$depth[gj],
+  shrinkage = gb_grid$rate[gj],
+  n.minobsinnode = 50,
+  bag.fraction = 0.8,
+  verbose = FALSE,
+  keep.data = FALSE
+)
+
+predict_model <- function(model, x) {
+
+  m <- design(x)
+
+  switch(
+    model,
+    "Linear" = drop(m %*% beta),
+    "Lasso" = drop(predict(lasso, m[, -1], s = best_lambda)),
+    "Random forest" = predict(rf, x)$predictions,
+    "Boosting" = predict(gb, x, n.trees = nt)
+  )
+}
+
+# ------------------------------------------------------------
+# 8. Held-out test performance and simple benchmarks
+# ------------------------------------------------------------
+
+preds <- data.frame(
+  order_id = test$order_id,
+  actual = test$y,
+  Mean_baseline = mean(train$y),
+  Median_baseline = median(train$y)
+)
+
+for (model in best$model) {
+  preds[[model]] <- predict_model(model, xe)
+}
+
+test_scores <- do.call(
+  rbind,
+  lapply(names(preds)[-(1:2)], function(nm) {
+    data.frame(
+      model = nm,
+      t(score(test$y, preds[[nm]])),
+      row.names = NULL
+    )
+  })
+)
+
+save_csv(test_scores, "test_scores.csv")
+save_csv(preds, "test_predictions.csv")
+
+# Secondary evaluation: sum predictions within each order.
+# This assumes the recorded row profits are additive.
+op <- aggregate(
+  preds[, -1],
+  list(order_id = preds$order_id),
+  sum
+)
+
+order_scores <- do.call(
+  rbind,
+  lapply(names(op)[-(1:2)], function(nm) {
+    data.frame(
+      model = nm,
+      t(score(op$actual, op[[nm]])),
+      row.names = NULL
+    )
+  })
+)
+
+save_csv(order_scores, "order_sum_test_scores.csv")
+
+# ------------------------------------------------------------
+# 9. Coefficients and feature importance
+# ------------------------------------------------------------
+
+save_csv(
+  data.frame(
+    term = names(ols$coefficients),
+    estimate = ols$coefficients
+  ),
+  "linear_coefficients.csv"
+)
+
+lc <- as.matrix(coef(lasso, s = best_lambda))
+
+save_csv(
+  data.frame(term = rownames(lc), estimate = lc[, 1]),
+  "lasso_coefficients.csv"
+)
+
+save_csv(
+  data.frame(
+    feature = names(rf$variable.importance),
+    importance = rf$variable.importance
+  ),
+  "rf_oob_importance.csv"
+)
+
+save_csv(
+  summary(gb, plotit = FALSE),
+  "boosting_relative_influence.csv"
+)
+
+# Test permutation importance for the already-selected model.
+# These results are for interpretation, not further tuning.
+set.seed(1448)
+
+base_rmse <- score(test$y, preds[[winner]])[1]
+
+pi <- do.call(
+  rbind,
+  lapply(predictors, function(v) {
+
+    inc <- replicate(3, {
+      xp <- xe
+      xp[[v]] <- sample(xp[[v]])
+
+      score(test$y, predict_model(winner, xp))[1] - base_rmse
+    })
+
+    data.frame(
+      feature = v,
+      RMSE_increase = mean(inc),
+      shuffle_sd = sd(inc)
+    )
+  })
+)
+
+save_csv(
+  pi[order(-pi$RMSE_increase), ],
+  "winner_permutation_importance.csv"
+)
+
+# ------------------------------------------------------------
+# 10. Paired bootstrap comparison with linear regression
+# ------------------------------------------------------------
+
+# Resample whole orders to preserve dependence among their rows.
+set.seed(2448)
+
+e <- data.frame(
+  order_id = test$order_id,
+  winner = (test$y - preds[[winner]])^2,
+  linear = (test$y - preds[["Linear"]])^2,
+  n = 1
+)
+
+ag <- aggregate(e[, -1], list(order_id = e$order_id), sum)
+
+delta <- replicate(500, {
+
+  z <- ag[sample.int(nrow(ag), replace = TRUE), ]
+
+  sqrt(sum(z$winner) / sum(z$n)) -
+    sqrt(sum(z$linear) / sum(z$n))
+})
+
+save_csv(
+  data.frame(
+    comparison = paste(winner, "minus Linear RMSE"),
+    difference = base_rmse -
+      score(test$y, preds[["Linear"]])[1],
+    lower = quantile(delta, 0.025),
+    upper = quantile(delta, 0.975)
+  ),
+  "paired_order_bootstrap.csv"
+)
+
+capture.output(
+  list(
+    selected_model = winner,
+    lambda = best_lambda,
+    random_forest = best_rf,
+    boosting = cbind(gb_grid[gj, ], trees = nt)
+  ),
+  file = file.path(out, "selected_parameters.txt")
+)
+
+capture.output(
+  sessionInfo(),
+  file = file.path(out, "session_info.txt")
+)
+
+print(best)
+print(test_scores)
+
+# Interpret Lasso coefficients:
+lasso_coefficients <- data.frame(
+  term = rownames(lc),
+  estimate = lc[, 1]
+)
+
+print(
+  lasso_coefficients[lasso_coefficients$estimate != 0, ]
+)
+
+print(pi[order(-pi$RMSE_increase), ])
+```
