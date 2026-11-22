@@ -41,3 +41,5 @@ renv/staging/
 
 # Specific to this repo: pdf renderings of the Rmarkdown file
 project.pdf
+DataCo_cleaned.csv
+model_results

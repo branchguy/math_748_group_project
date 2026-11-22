@@ -129,6 +129,9 @@ unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname",
 
 df_clean <- df %>%
   select(-any_of(unnecessary_vars))
+
+# df_clean <- read.csv("DataCo_cleaned.csv")
+
 head(df_clean)
 ```
 
@@ -154,7 +157,7 @@ paste("Distinct Sites: ", df_clean %>% select(Latitude, Longitude) %>% distinct 
 ### Late_delivery_risk
 
 ```{r eda}
-top_ten <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
+top_ten_num <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
 
 top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer Segment", "Department Name", "Market", "Order City", "Order Country", "Order Region", "Order State", "Product Name", "Shipping Mode")
@@ -170,7 +173,7 @@ top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer
 
 
 df_clean %>% 
-  select(top_ten) %>% 
+  select(top_ten_num) %>% 
   pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = value)) +
   geom_histogram(bins = 20, fill = "royalblue", color = "white") +
@@ -220,7 +223,7 @@ df_clean %>%
 
 ```{r late_hist}
 df_clean %>%
-  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  pivot_longer(cols = top_ten_num, names_to = "predictor", values_to = "x_value") %>%
   ggplot(aes(x = x_value, fill = Late_delivery_risk)) +
   geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
   facet_wrap(~ predictor, scales = "free_x", ncol = 4) + # 10 distinct plots
@@ -262,7 +265,7 @@ df_clean %>%
       labels = c("Very Low", "Low", "High", "Very High")
     )
   ) %>%
-  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  pivot_longer(cols = top_ten_num, names_to = "predictor", values_to = "x_value") %>%
   ggplot(aes(x = x_value, fill = benefit_per_order_group)) +
   geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
   facet_wrap(~ predictor, scales = "free_x", ncol = 4) +
@@ -274,52 +277,139 @@ df_clean %>%
 
 ```{r late_cor}
 df_clean %>% 
-  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten_num) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
   cor_mat
 ```
 
 ```{r bene_cor}
 df_clean %>% filter(`Product Price` > 1000) %>% 
-  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten_num) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
   cor_mat
 ```
 
 ## Analysis
 
+```{r preprocessing helper functions}
+learn_prep <- function(a) {
+
+  med <- sapply(
+    a[, num, drop = FALSE],
+    function(z) median(z[is.finite(z)])
+  )
+
+  lev <- lapply(
+    a[, catvars, drop = FALSE],
+    function(z) sort(unique(z[!is.na(z) & nzchar(z)]))
+  )
+
+  modes <- sapply(a[, catvars, drop = FALSE], function(z) {
+    z <- z[!is.na(z) & nzchar(z)]
+    names(sort(table(z), decreasing = TRUE))[1]
+  })
+
+  stopifnot(all(is.finite(med)), all(lengths(lev) >= 2))
+
+  list(med = med, lev = lev, modes = modes)
+}
+
+apply_prep <- function(a, p) {
+
+  x <- a[, predictors, drop = FALSE]
+
+  for (v in num) {
+    x[[v]][!is.finite(x[[v]])] <- p$med[[v]]
+  }
+
+  for (v in catvars) {
+    z <- x[[v]]
+    z[is.na(z) | !z %in% p$lev[[v]]] <- p$modes[[v]]
+    x[[v]] <- factor(z, levels = p$lev[[v]])
+  }
+
+  x
+}
+
+design <- function(x) model.matrix(~ ., x)
+```
+
 ### Validation Split
 
 > "Approximately 75% of the observations will be used for training, while the remaining 25% of data will be reserved for testing. We also plan to use 5 Fold Cross Validation on this dataset"
 
+Assuming that there are multiple items within an order, lets check if items within order can have mixed values for being late or not. If so, we will need to aggregate the data to the order level for classification.
+
+```{r rm cancelled shipping}
+
+df_clean %>% group_by(Late_delivery_risk, `Order Id`, `Order Item Id`) %>%
+  summarise(n = n()) %>% 
+  # then group by frequency
+  ungroup() %>%
+  group_by(n) %>% count()
+
+df_clean %>% distinct(`Order Id`) %>% count()
+df_clean %>% count()
+# how many items per order
+df_clean %>% group_by(`Order Id`) %>% count() %>% ungroup() %>% 
+  group_by(n) %>% count() %>% ungroup() %>% 
+  mutate(percent = n / sum(n) * 100)
+```
+
+Ok so we can see that only the `Order Id` recieves a `Late_delivery_risk` value of 1 or 0, so we would like to use the `Order Id` as basic unit in validation. This makes sense because orders should get shipped together. Next lets check dictinct item columns when we aggregate by `Order Id`.
+
+```{r check order id}
+df_clean %>% 
+  # sample some rows to test
+  slice_sample(n = 100) %>%
+  # group by Order id and summarize the numerical and categorical predictors
+  summarise(
+    n_rows = n(),
+    n_late_values = n_distinct(Late_delivery_risk),
+    n_shipping_modes = n_distinct(`Shipping Mode`),
+    n_regions = n_distinct(`Order Region`),
+    n_categories = n_distinct(`Category Name`),
+    .groups = "drop"
+  ) %>%
+  # now count the number of distinct rows for each column per order id
+  summarise(
+    orders = n(),
+    mixed_late_labels = sum(n_late_values > 1),
+    mixed_shipping_modes = sum(n_shipping_modes > 1),
+    mixed_regions = sum(n_regions > 1),
+    mixed_categories = sum(n_categories > 1)
+  )
+```
+
+It seems like this gets complicated, not only on the numerical aggregation but also on the categorical aggregation. For example, if we have multiple items of with different qualities and unique item categories we have no way to summarize that. We will have to use the item level data for our analysis and acknowledge the implications on our final results. Instead lets change the validation split to be based on the `Order Id` instead of the item level data. This way we can ensure that all items within an order are either in the training or testing set.
 
 ```{r validation split}
 set.seed(1)
 
-train_idx <- sample(1:nrow(df_clean), size = round(0.75 * nrow(df_clean)))
-train <- df_clean[train_idx, ]
-test <- df_clean[-train_idx, ]
+
+order_ids <- df_clean %>% distinct(`Order Id`)
+
+train_idx <- sample(order_ids$`Order Id`, size = round(0.75 * length(order_ids$`Order Id`)))
+train <- df_clean[df_clean$`Order Id` %in% train_idx, ]
+test <- df_clean[!df_clean$`Order Id` %in% train_idx, ]
 ```
 
+### Response Variable: `Late_delivery_risk`
 
+#### Classification Regression (Method 1)
 
-### Classification Regression (Method 1)
+Notes: added in some of the top ten numerical predictors but didn't find anything useful outside of item profit ratio which didn't help
 
-added in some of the top ten numerical predictors but didn't find anything useful outside of item profit ratio which didn't help
-
-#### Response Variable: `Late_delivery_risk`
 
 ```{r logistic regression late delivery risk}
 
-# inspect the number of n distinct rows for each column
-df_clean %>% summarise(across(everything(), n_distinct))
-
 # define usable categories (issues with the others)
-usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
-# all our selected predictors
-# predictors = c(top_ten, top_ten_cat)
+# usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
+# some useful predictors to start with
+predictors <- c("Shipping Mode", "Scheduled Shipping Days", "Market", "Order Region", "Order Item Category")
 
-safe_top_ten_num <- paste0("`", top_ten, "`") # numerical predictors to fit on
+
+safe_top_ten_num <- paste0("`", top_ten_num, "`") # numerical predictors to fit on
 safe_top_ten <- paste0("`", usable_cat, "`") # categorical predictors to fit on
 top_sixteen <- c(safe_top_ten, safe_top_ten_num) # categorical + numerical predictors
 
@@ -364,35 +454,11 @@ roc_curve(roc_obj)
 rm(lm.fit)
 ```
 
- notice that the roc curve has these kinks / segments which is indicative of the categorical model dependent on a set of categories, instead of a continuous variable --> caused by only fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
-
-#### Response Variable: `Benefit_per_order`
-
-```{r log regression benefit per order}
-lm.fit <- lm(reformulate(top_sixteen, response="`Benefit per order`"), data=train)
-summary(lm.fit)
-AIC(lm.fit)
-summary(lm.fit)$adj.r.squared # Adjusted R^2
-
-lm.preds <- predict(lm.fit, newdata=test, type="response")
+ notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable --> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
+ note: this is not always the case
 
 
-eval_benefit_per_order <- function(preds) {
-  lm.RMSE <- sqrt(mean((test$`Benefit per order` - preds)^2))
-  paste("RMSE", lm.RMSE)
-  
-  lm.MAE <- mean(abs(test$`Benefit per order` - preds))
-  paste("MAE", lm.MAE)
-  return(list(rmse=lm.RMSE, mae=lm.MAE))
-}
-# out comes list of RMSE and MAE
-lm.out <- eval_benefit_per_order(lm.preds)
-lm.out$rmse
-```
-
-the fact that RMSE and MAE are so different is because we have significant outliers (not only in the predictors but also in the Benefit per order)
-
-### Lasso Regression (Method 2)
+#### Lasso Regression (Method 2)
 
 ```{r lasso regression late delivery risk}
 library(glmnet)
@@ -410,7 +476,7 @@ ridge.pred=predict(ridge.mod,s=4,newx=x[test,])
 ```
 
 
-### Boosted Random Forest (Method 3)
+#### Boosted Random Forest (Method 3)
 
 ```{r load}
 library(gbm)
@@ -430,13 +496,6 @@ boosted.rf.fit <- gbm(
   interaction.depth=4)
 
 ```
-
-### Logistic Cubic Spline (Method 4)
-
-```{r}
-
-```
-
 
 
 
