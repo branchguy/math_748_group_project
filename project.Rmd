@@ -130,7 +130,7 @@ str(df)
 ```{r var select}
 unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
 
-df_clean <- df %>% filter("Delivery Status" != "Shipping canceled") %>%
+df_clean <- df %>% filter(`Delivery Status` != "Shipping canceled") %>%
   select(-any_of(unnecessary_vars))
 
 # df_clean <- read.csv("DataCo_cleaned.csv")
