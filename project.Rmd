@@ -123,11 +123,11 @@ df <- df %>%
 
 str(df)
 ```
-### Step 4. Unnecessary Variables
+### Step 4. Unnecessary Variables and rows
 ```{r var select}
 unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
 
-df_clean <- df %>%
+df_clean <- df %>% filter("Delivery Status" != "Shipping canceled") %>%
   select(-any_of(unnecessary_vars))
 
 # df_clean <- read.csv("DataCo_cleaned.csv")
@@ -292,6 +292,36 @@ df_clean %>% filter(`Product Price` > 1000) %>%
 ## Analysis
 
 ```{r preprocessing helper functions}
+# ideas 
+# top_ten_num <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
+#   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
+
+# top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer Segment", "Department Name", "Market", "Order City", "Order Country", "Order Region", "Order State", "Product Name", "Shipping Mode")
+
+# some useful predictors to start with
+num <- c(
+  "Days for shipment (scheduled)", 
+  "Order Item Profit Ratio")
+
+catvars <- c(
+  "Shipping Mode",
+  "Market",
+  "Order Region",
+  "Category Name",
+  "Customer Country"
+)
+
+
+predictors <- c(num, catvars)
+
+# Stop early if a name is misspelled or missing.
+stopifnot(all(predictors %in% names(train)))
+
+# helper expects character categories
+train <- train %>%
+  mutate(across(all_of(catvars), as.character))
+
+
 learn_prep <- function(a) {
 
   med <- sapply(
@@ -340,7 +370,7 @@ design <- function(x) model.matrix(~ ., x)
 
 Assuming that there are multiple items within an order, lets check if items within order can have mixed values for being late or not. If so, we will need to aggregate the data to the order level for classification.
 
-```{r rm cancelled shipping}
+```{r inspect order and items relationship}
 
 df_clean %>% group_by(Late_delivery_risk, `Order Id`, `Order Item Id`) %>%
   summarise(n = n()) %>% 
@@ -400,58 +430,119 @@ test <- df_clean[!df_clean$`Order Id` %in% train_idx, ]
 
 Notes: added in some of the top ten numerical predictors but didn't find anything useful outside of item profit ratio which didn't help
 
+```{r cross validation five-fold}
 
-```{r logistic regression late delivery risk}
+# setup 5-fold cross validation
+k <- 5
+order_labels <- train %>% distinct(`Order Id`, Late_delivery_risk)
+fold_map <- order_labels %>% 
+  group_by(Late_delivery_risk) %>%
+  mutate(fold = sample(rep(1:k, length.out = n()))) %>% 
+  ungroup() %>%
+  select(`Order Id`, fold)
 
-# define usable categories (issues with the others)
-# usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
-# some useful predictors to start with
-predictors <- c("Shipping Mode", "Scheduled Shipping Days", "Market", "Order Region", "Order Item Category")
+train_cv <- train %>% left_join(fold_map, by = "Order Id")
+# every fold should have no NA and one row per order id
+
+run_logistic_fold <- function(k, data) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep) %>% 
+    mutate(Late_delivery_risk = train_fold$Late_delivery_risk)
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  mf <- reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk")
+  log.fit <- glm(mf, data=train_prepped, family = binomial)
+
+  return(
+    tibble(
+      fold = k, 
+      order_id = validation_fold$`Order Id`,
+      gold = as.character(validation_fold$Late_delivery_risk),
+      probability = as.numeric(
+        predict(log.fit, newdata=validation_prepped, type="response")
+      )
+    )
+  )
+}
+
+cv_predictions <- map_dfr(
+  1:k,
+  ~ run_logistic_fold(.x, train_cv)
+)
+
+```
+
+Now we score each fold and calculate the overall accuracy, precision, recall, and F1 score, AUC, AIC and ROC curve.
+
+```{r logistic regression scoring}
+
+score_fold <- function(data, threshold = 0.5) {
+  gold <- as.factor(data$gold)
+  preds <- as.factor(ifelse(data$probability > threshold, "1", "0"))
+  cm <- confusionMatrix(data=preds, reference=gold, positive = "1")
+  roc_obj <- roc(response = gold, predictor = data$probability, levels = c("0", "1"), direction = "<", quiet = TRUE)
+  
+  return(
+    tibble(
+      accuracy = cm$overall["Accuracy"],
+      precision = cm$byClass["Precision"],
+      recall = cm$byClass["Recall"],
+      f1 = cm$byClass["F1"],
+      roc_auc = as.numeric(auc(roc_obj)),
+      roc_obj = list(roc_obj)
+    )
+  )
+}
+set.threshold <- 0.7
+
+cv_scores <- cv_predictions %>%
+  group_by(fold) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+cv_scores
+
+cv_scores %>% summarise(across(
+  c(accuracy, precision, recall, f1, roc_auc), list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+)) %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = c("metric", ".value"), 
+    names_pattern = "(.*)_(.*)") %>%
+  select(metric, mean, sd)
 
 
-safe_top_ten_num <- paste0("`", top_ten_num, "`") # numerical predictors to fit on
-safe_top_ten <- paste0("`", usable_cat, "`") # categorical predictors to fit on
-top_sixteen <- c(safe_top_ten, safe_top_ten_num) # categorical + numerical predictors
-
-# fit is adjusted to just include the numerical Order Profit Ratio as the rest didn't have high p-values
-lm.fit <- glm(reformulate(c(safe_top_ten, safe_top_ten_num[8]), response="Late_delivery_risk"), data=train, family = binomial)
-summary(lm.fit)
-AIC(lm.fit)
-
-log.probs <- predict(lm.fit, newdata=test, type="response")
-log.preds <- ifelse(log.probs > 0.5, 1, 0)
-log.cm <- confusionMatrix(data=as.factor(log.preds), ref=as.factor(test$Late_delivery_risk), positive = "1")
-log.cm
-hist(log.probs)
-# calculate roc
-roc_obj <- roc(response = as.factor(test$Late_delivery_risk), predictor = log.probs)
-
-roc_curve <- function(roc_obj) {
-  # simple plot is ugly
-  # plot(roc_obj, print.auc = TRUE, main = "ROC Curve")
-  # using ggplot for ROC curve
-  ggroc(roc_obj, colour = "#2C3E50", size = 1.2, legacy.axes = TRUE) +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
-    annotate("text", x = 0.70, y = 0.25, 
-             label = paste("AUC =", round(auc(roc_obj),2)), 
-             size = 5, fontface = "bold", color = "#2C3E50") +
+# Overlay all ROC curves from each fold
+roc_curves <- function(all_scores) {
+  fold_rocs <- all_scores %>% pull(roc_obj)
+  # use ggplot for ROC curves
+  ggroc(fold_rocs, legacy.axes = TRUE) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "gray60") +
+    annotate("text", x = 0.70, y = 0.25,
+            label = paste("Mean AUC =", round(mean(map_dbl(fold_rocs, auc)), 2)),
+            size = 5, fontface = "bold", color = "#2C3E50"
+    ) +
     labs(
-      title = "ROC Curve",
+      title = "ROC Curves for Each Fold",
       x = "False Positive Rate (1 - Specificity)",
-      y = "True Positive Rate (Sensitivity)"
+      y = "True Positive Rate (Sensitivity)",
+      colour = "Fold"
     ) +
     coord_equal() +
     theme_minimal(base_size = 13) +
     theme(
-      plot.title = element_text(face = "bold"),
+      plot.title = element_text(hjust = 0.5, face = "bold"),
       panel.grid.minor = element_blank(),
       panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
     )
 }
 
-roc_curve(roc_obj)
-# clean up memory so computer survives
-rm(lm.fit)
+roc_curves(cv_scores)
+
 ```
 
  notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable --> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
