@@ -486,8 +486,8 @@ Now we score each fold and calculate the overall accuracy, precision, recall, an
 ```{r logistic regression scoring}
 
 score_fold <- function(data, threshold = 0.5) {
-  gold <- as.factor(data$gold, levels = c("0", "1"))
-  preds <- as.factor(ifelse(data$probability > threshold, "1", "0", levels = c("0", "1")))
+  gold <- factor(data$gold, levels = c("0", "1"))
+  preds <- factor(ifelse(data$probability > threshold, "1", "0"), levels = c("0", "1"))
   cm <- confusionMatrix(data=preds, reference=gold, positive = "1")
   roc_obj <- roc(response = gold, predictor = data$probability, levels = c("0", "1"), direction = "<", quiet = TRUE)
   
@@ -835,6 +835,139 @@ boost_summary <- boost_scores %>%
 
 boost_summary
 ```
+
+### Feature importance for the selected classification models
+
+The following models are refitted on all training rows using the tuning settings
+with the highest mean cross-validation F1 score at the threshold used above.
+The test set is not used to select settings or calculate these importance
+measures. Since the models use item-level rows, orders with more rows can have
+more influence on the fitted models.
+
+```{r selected classification settings}
+# Resolve ties consistently and reject configurations with undefined scores.
+best_lasso <- lasso_summary %>%
+  filter(is.finite(mean_f1)) %>%
+  arrange(desc(mean_f1), desc(lambda)) %>%
+  slice(1)
+
+best_rf <- rf_summary %>%
+  filter(is.finite(mean_f1)) %>%
+  arrange(desc(mean_f1), mtry, desc(min.node.size)) %>%
+  slice(1)
+
+best_boost <- boost_summary %>%
+  filter(is.finite(mean_f1)) %>%
+  arrange(desc(mean_f1), depth, rate, n_trees) %>%
+  slice(1)
+
+
+best_lasso
+best_rf
+best_boost
+
+# Learn preprocessing again using all training data, not the test set.
+importance_prep <- learn_prep(train)
+importance_train <- apply_prep(train, importance_prep)
+importance_y <- factor(as.character(train$Late_delivery_risk), levels = c("0", "1"))
+```
+
+#### Lasso coefficients
+
+Lasso shrinks coefficients toward zero. The table shows nonzero coefficients on
+the log-odds scale, excluding the intercept. Categorical terms compare a level
+with its reference level; numeric terms describe a one-unit change. Coefficient
+magnitudes depend on predictor units and should not be treated as a direct
+ranking of whole features, particularly across categorical and numeric terms.
+
+```{r lasso feature importance}
+importance_matrix <- design(importance_train)[, -1, drop = FALSE]
+
+lasso_final <- glmnet(
+  x = importance_matrix,
+  y = as.integer(as.character(importance_y)),
+  family = "binomial",
+  alpha = 1,
+  lambda = grid_search_lambda
+)
+
+lasso_coef <- as.matrix(coef(lasso_final, s = best_lasso$lambda))
+lasso_importance <- tibble(
+  term = rownames(lasso_coef),
+  coefficient = as.numeric(lasso_coef[, 1])
+) %>%
+  filter(term != "(Intercept)", coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+lasso_importance
+```
+
+#### Random forest permutation importance
+
+This measures how much the forest's out-of-bag prediction error increases when
+each feature is shuffled. Larger values suggest greater reliance on that
+feature. Out-of-bag observations are sampled at the row level, so other rows
+from the same order can still be present in a tree's fitting sample.
+
+```{r random forest feature importance}
+set.seed(448)
+rf_final <- ranger(
+  x = importance_train,
+  y = importance_y,
+  probability = TRUE,
+  num.trees = 300,
+  mtry = best_rf$mtry,
+  min.node.size = best_rf$min.node.size,
+  respect.unordered.factors = "order",
+  importance = "permutation",
+  num.threads = 2
+)
+
+rf_importance <- tibble(
+  feature = names(rf_final$variable.importance),
+  importance = as.numeric(rf_final$variable.importance)
+) %>%
+  arrange(desc(importance))
+
+rf_importance
+```
+
+#### Gradient boosting relative influence
+
+Relative influence summarizes how much each feature contributed to splits in
+the fitted boosted trees. These values use a different definition from random
+forest permutation importance and are not directly comparable across models.
+
+```{r boosting feature importance}
+boost_train <- importance_train %>%
+  mutate(late = as.integer(as.character(importance_y)))
+boost_formula <- reformulate(paste0("`", predictors, "`"), response = "late")
+
+set.seed(1448)
+boost_final <- gbm(
+  formula = boost_formula,
+  data = boost_train,
+  distribution = "bernoulli",
+  n.trees = best_boost$n_trees,
+  interaction.depth = best_boost$depth,
+  shrinkage = best_boost$rate,
+  n.minobsinnode = 50,
+  bag.fraction = 0.8,
+  verbose = FALSE,
+  keep.data = FALSE,
+  n.cores = 1
+)
+
+boost_importance <- summary(boost_final, plotit = FALSE) %>%
+  as_tibble() %>%
+  rename(feature = var, relative_influence = rel.inf) %>%
+  arrange(desc(relative_influence))
+
+boost_importance
+```
+
+These importance measures describe model behavior and associations, not causal
+effects. Correlated predictors can share or mask importance.
 
 
 
