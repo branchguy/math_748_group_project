@@ -16,6 +16,9 @@ In modern supply chain management, late deliveries and unprofitable orders repre
 ```{r setupkaggle, include=FALSE, echo=FALSE}
 library(RKaggle)
 library(rstatix)
+library(glmnet)
+library(gbm)
+library(ranger)
 library(dplyr)
 library(zeallot)
 library(purrr)
@@ -497,7 +500,7 @@ score_fold <- function(data, threshold = 0.5) {
     )
   )
 }
-set.threshold <- 0.7
+set.threshold <- 0.5
 
 cv_scores <- cv_predictions %>%
   group_by(fold) %>%
@@ -545,29 +548,111 @@ roc_curves(cv_scores)
 
 ```
 
- notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable --> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
+It seems like with a threshold of $0.5$, the mean accuracy sits around $0.712$ and and the precision around $0.84$. However, recall is lower around $0.56$ which means that we are missing a lot of late delivery risk orders and the F1 captures this. The AUC is around $0.72$ which is decent but not great. We can notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable \-\-\> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
+ 
  note: this is not always the case
 
 
 #### Lasso Regression (Method 2)
 
+```{r lasso cross validation folds}
+
+run_lasso_fold <- function(k, data, lambda_values) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep)
+  train_prepped <- design(train_prepped)[, -1, drop = FALSE]
+  validation_prepped <- apply_prep(validation_fold, prep)
+  validation_prepped <- design(validation_prepped)[, -1, drop = FALSE]
+  
+  # fit lasso for mulitple lambda params
+  lasso.fit <- glmnet(
+    x = train_prepped, 
+    y = as.integer(as.character(train_fold$Late_delivery_risk)), 
+    family = binomial,
+    alpha = 1,
+    lambda = lambda_values
+  )
+
+  map_dfr(
+    seq_along(lambda_values),
+    function(i) {
+      tibble(
+        fold = k, 
+        lambda = lambda_values[i],
+        order_id = validation_fold$`Order Id`,
+        gold = as.character(validation_fold$Late_delivery_risk),
+        probability = as.numeric(
+          predict(lasso.fit, newx=validation_prepped, type="response", s=lambda_values[i])
+        )
+      )
+    }
+  )
+}
+
+grid_search_lambda <- 10^seq(-4, 0, length.out = 100)
+lasso_cv_predictions <- map_dfr(
+  1:k,
+  ~ run_lasso_fold(.x, train_cv, grid_search_lambda)
+)
+```
+
 ```{r lasso regression late delivery risk}
-library(glmnet)
 
-x <- model.matrix(reformulate(safe_top_ten_num, response = "`Benefit per order`"), data = df_clean)[, -1]
-y <- model.response(model.frame(reformulate(safe_top_ten_num, response = "`Benefit per order`"), data = df_clean))
+lasso_scores <- lasso_cv_predictions %>%
+  group_by(fold, lambda) %>%
+  group_modify(~ score_fold(.x, threshold = 0.5)) %>%
+  ungroup()
 
-cv_lasso <- cv.glmnet(x, y, alpha = 1)
-plot(cv_lasso)
-# 5. View the optimal lambda values and non-zero coefficients
-best_lambda <- cv_lasso$lambda.min
-coef(cv_lasso, s = "lambda.min")
+# lasso_summary <- lasso_scores %>% 
+#   group_by(lambda) %>%
+#   summarise(across(
+#     c(accuracy, precision, recall, f1, roc_auc), 
+#     list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+#   )) %>%
+#   ungroup()
 
-ridge.pred=predict(ridge.mod,s=4,newx=x[test,])
+lasso_summary <- lasso_scores %>%
+  group_by(lambda) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+lasso_summary %>% print(n = 100)
+
+### A plot of the mean F1 score and mean AUC score against lambda values to visualize the trade-off between model complexity and performance.
+lasso_summary %>%
+  pivot_longer(cols = c(mean_f1, mean_roc_auc), names_to = "metric", values_to = "mean_score") %>%
+  ggplot(aes(x = log10(lambda), y = mean_score, color = metric)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Mean F1 Score and Mean AUC Score vs Log10(Lambda)",
+    x = "Log10(Lambda)",
+    y = "Mean Score",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+  )
+
 ```
 
 
-#### Boosted Random Forest (Method 3)
+#### Random Forest (Method 3)
+
+```{r}
+
+```
+
+#### Boosted Random Forest (Method 4)
 
 ```{r load}
 library(gbm)
