@@ -317,13 +317,6 @@ catvars <- c(
 
 predictors <- c(num, catvars)
 
-# Stop early if a name is misspelled or missing.
-stopifnot(all(predictors %in% names(train)))
-
-# helper expects character categories
-train <- train %>%
-  mutate(across(all_of(catvars), as.character))
-
 
 learn_prep <- function(a) {
 
@@ -425,6 +418,15 @@ order_ids <- df_clean %>% distinct(`Order Id`)
 train_idx <- sample(order_ids$`Order Id`, size = round(0.75 * length(order_ids$`Order Id`)))
 train <- df_clean[df_clean$`Order Id` %in% train_idx, ]
 test <- df_clean[!df_clean$`Order Id` %in% train_idx, ]
+
+# Stop early if a name is misspelled or missing.
+stopifnot(all(predictors %in% names(train)))
+
+# helper expects character categories
+train <- train %>%
+  mutate(across(all_of(catvars), as.character))
+
+
 ```
 
 ### Response Variable: `Late_delivery_risk`
@@ -484,8 +486,8 @@ Now we score each fold and calculate the overall accuracy, precision, recall, an
 ```{r logistic regression scoring}
 
 score_fold <- function(data, threshold = 0.5) {
-  gold <- as.factor(data$gold)
-  preds <- as.factor(ifelse(data$probability > threshold, "1", "0"))
+  gold <- as.factor(data$gold, levels = c("0", "1"))
+  preds <- as.factor(ifelse(data$probability > threshold, "1", "0", levels = c("0", "1")))
   cm <- confusionMatrix(data=preds, reference=gold, positive = "1")
   roc_obj <- roc(response = gold, predictor = data$probability, levels = c("0", "1"), direction = "<", quiet = TRUE)
   
@@ -572,7 +574,7 @@ run_lasso_fold <- function(k, data, lambda_values) {
   lasso.fit <- glmnet(
     x = train_prepped, 
     y = as.integer(as.character(train_fold$Late_delivery_risk)), 
-    family = binomial,
+    family = "binomial",
     alpha = 1,
     lambda = lambda_values
   )
@@ -650,9 +652,84 @@ lasso_summary %>%
 
 ```{r}
 
+rf_param_grid <- expand.grid(
+  mtry = c(2L, 4L, 7L),
+  min.node.size = c(25L, 100L)
+)
+
+run_rf_fold <- function(k, data, mtry, min_node) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep)
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  rf.fit <- ranger(
+    x = train_prepped,
+    y = factor(as.character(train_fold$Late_delivery_risk), levels = c("0", "1")),
+    data = train_prepped,
+    mtry = mtry,
+    min.node.size = min_node,
+    probability = TRUE,
+    num.trees = 300,
+    respect.unordered.factors = "order",
+    num.threads = 2
+  )
+
+  return(
+    tibble(
+      fold = k,
+      mtry = mtry,
+      min.node.size = min_node,
+      order_id = validation_fold$`Order Id`,
+      gold = as.character(validation_fold$Late_delivery_risk),
+      probability = as.numeric(
+        predict(rf.fit, data = validation_prepped)$predictions[, "1"]
+      )
+    )
+  )
+}
+set.seed(1)
+
+# takes a while about 3-5 mins
+rf_cv_preds <- map_dfr(
+  seq_len(nrow(rf_param_grid)),
+  function(i) {
+    map_dfr(
+      1:k,
+      ~ run_rf_fold(.x, train_cv, rf_param_grid$mtry[i], rf_param_grid$min.node.size[i])
+    )
+  }
+)
+
 ```
 
-#### Boosted Random Forest (Method 4)
+Get the results out
+
+```{r}
+
+rf_scores <- rf_cv_preds %>%
+  group_by(fold, mtry, min.node.size) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+
+rf_summary <- rf_scores %>%
+  group_by(mtry, min.node.size) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+
+rf_summary
+
+```
+
+
+#### Gradient Boosting (Method 4)
 
 ```{r load}
 library(gbm)
@@ -664,16 +741,100 @@ set.seed(1)
 #n.trees: number of trees (default 100)
 #interaction.depth=4 limits the depth of each tree (default 1)
 
-boosted.rf.fit <- gbm(
-  reformulate(safe_top_ten, response = "`Benefit per order`"), 
-  data=df_clean,
-  distribution="gaussian",
-  n.trees=5000,
-  interaction.depth=4)
+boost_param_grid <- expand.grid(
+  depth = c(1L, 3L),
+  rate = c(0.03, 0.10)
+)
+
+tree_param_grid <- c(100L, 300L, 600L)
+
+run_boost_fold <- function(k, data, depth, rate, tree_values) {
+
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep) %>% 
+    mutate(Late_delivery_risk = as.integer(as.character(train_fold$Late_delivery_risk)))
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  model_formula <- reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk")
+
+  boost_fit <- gbm(
+    formula = reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk"),
+    data = train_prepped,
+    distribution = "bernoulli",
+    n.trees = max(tree_values),
+    interaction.depth = depth,
+    shrinkage = rate,
+    n.minobsinnode = 50,
+    bag.fraction = 0.8,
+    verbose = FALSE,
+    keep.data = FALSE,
+    n.cores = 1
+  )
+
+  map_dfr(
+    tree_values, function(num_trees) {
+      tibble(
+        fold = k,
+        depth = depth,
+        rate = rate,
+        n_trees = num_trees,
+        order_id = validation_fold$`Order Id`,
+        gold = as.character(validation_fold$Late_delivery_risk),
+        probability = as.numeric(
+          predict(
+            boost_fit,
+            newdata = validation_prepped,
+            n.trees = num_trees,
+            type = "response"
+          )
+        )
+      )
+    }
+  )
+}
+
+
+boost_cv_predictions <- map_dfr(
+  seq_len(nrow(boost_param_grid)),
+  function(i) {
+    map_dfr(
+      1:k,
+      ~ run_boost_fold(
+        k = .x,
+        data = train_cv,
+        depth = boost_param_grid$depth[i],
+        rate = boost_param_grid$rate[i],
+        tree_values = tree_param_grid
+      )
+    )
+  }
+)
+
 
 ```
 
+Find results from CV gradient boosting
 
+```{r}
+boost_scores <- boost_cv_predictions %>%
+  group_by(fold, depth, rate, n_trees) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+
+boost_summary <- boost_scores %>%
+  group_by(depth, rate, n_trees) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+
+boost_summary
+```
 
 
 
