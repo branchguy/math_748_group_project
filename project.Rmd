@@ -1069,7 +1069,8 @@ the proportion flagged help assess whether a model raises too many alerts.
 
 These are item-row metrics, so orders with more rows have more weight. Threshold
 and model selection used these same folds, so the selected CV results may be
-optimistic. Test columns remain empty until the final evaluation.
+optimistic. The held-out test scores are added after the selected models are
+refitted below.
 
 ```{r classification comparison}
 # Each validation fold receives the late rate learned from the other folds.
@@ -1105,7 +1106,7 @@ comparison_metrics <- function(predictions, method) {
     group_by(fold) %>%
     group_modify(function(.x, .y) {
       score_fold(.x, threshold = set.threshold) %>%
-        select(precision, recall, f1, roc_auc) %>%
+        select(accuracy, precision, recall, f1, roc_auc) %>%
         mutate(alert_rate = mean(.x$probability > set.threshold))
     }) %>%
     ungroup()
@@ -1113,7 +1114,7 @@ comparison_metrics <- function(predictions, method) {
   stopifnot(nrow(fold_metrics) == k, n_distinct(fold_metrics$fold) == k)
 
   fold_metrics %>%
-    summarise(across(c(precision, recall, f1, roc_auc, alert_rate), mean)) %>%
+    summarise(across(c(accuracy, precision, recall, f1, roc_auc, alert_rate), mean)) %>%
     mutate(method = method, .before = 1)
 }
 
@@ -1126,19 +1127,216 @@ model_comparison <- bind_rows(
   comparison_metrics(selected_boost_predictions, "Gradient boosting")
 ) %>%
   rename(
+    cv_accuracy = accuracy,
     cv_auc_roc = roc_auc,
     cv_f1 = f1,
     cv_precision = precision,
     cv_recall = recall,
     cv_alert_rate = alert_rate
   ) %>%
-  mutate(test_auc_roc = NA_real_, test_f1 = NA_real_) %>%
-  select(method, cv_auc_roc, cv_f1, cv_precision, cv_recall, cv_alert_rate,
-         test_auc_roc, test_f1)
+  select(method, cv_accuracy, cv_auc_roc, cv_f1, cv_precision, cv_recall, cv_alert_rate)
 
 model_comparison
 ```
 
+### Held-out test evaluation
 
+The predictors, model settings, and classification threshold were selected
+using the training data. Apply the preprocessing learned from the full training
+set to the held-out orders, then score each refitted model and both benchmarks.
+These are item-row metrics; orders containing more rows have more weight.
 
+```{r classification test evaluation}
+stopifnot(!any(train$`Order Id` %in% test$`Order Id`))
+test_input <- test %>% mutate(across(all_of(catvars), as.character))
+test_prepped <- apply_prep(test_input, importance_prep)
+test_matrix <- design(test_prepped)[, -1, drop = FALSE]
+stopifnot(identical(colnames(importance_matrix), colnames(test_matrix)))
 
+# The other selected models were already refitted in the importance section.
+logistic_train <- importance_train %>% mutate(Late_delivery_risk = importance_y)
+logistic_formula <- reformulate(paste0("`", predictors, "`"),
+                               response = "Late_delivery_risk")
+logistic_final <- glm(logistic_formula, data = logistic_train, family = binomial())
+
+test_predictions <- tibble(
+  order_id = test$`Order Id`,
+  gold = as.character(test$Late_delivery_risk),
+  `Training prevalence benchmark` = mean(as.character(importance_y) == "1"),
+  `Always-late benchmark` = 1,
+  `Logistic regression` = as.numeric(predict(logistic_final, test_prepped, type = "response")),
+  `Lasso logistic regression` = as.numeric(predict(lasso_final, newx = test_matrix,
+                                                  s = best_lasso$lambda, type = "response")),
+  `Random forest` = as.numeric(predict(rf_final, data = test_prepped)$predictions[, "1"]),
+  `Gradient boosting` = as.numeric(predict(boost_final, newdata = test_prepped,
+                                           n.trees = best_boost$n_trees, type = "response"))
+)
+
+test_scores <- test_predictions %>%
+  pivot_longer(-c(order_id, gold), names_to = "method", values_to = "probability") %>%
+  group_by(method) %>%
+  group_modify(function(.x, .y) {
+    score_fold(.x, threshold = set.threshold) %>%
+      select(accuracy, precision, recall, f1, roc_auc) %>%
+      mutate(alert_rate = mean(.x$probability > set.threshold))
+  }) %>%
+  ungroup() %>%
+  rename_with(~ paste0("test_", .x), -method)
+
+model_comparison <- model_comparison %>% left_join(test_scores, by = "method")
+model_comparison
+```
+
+### Interpretation of the selected random forest
+
+We chose the random forest after reviewing the test comparison. Consequently,
+its test metrics are descriptive for this model choice; an additional untouched
+evaluation set would be needed for an independent estimate after selection. The
+forest averages probabilities from 300 trees, then flags a row as late when the
+average is greater than the selected threshold. The tree shown below is tree 1,
+chosen for illustration; it is not necessarily representative of the other
+trees or the complete forest. Only its first two split levels are plotted so
+that the diagram remains readable.
+
+```{r random forest parameters and performance}
+rf_parameters <- tibble(
+  parameter = c("Number of trees", "Predictors considered at each split (mtry)",
+                "Minimum node size for splitting", "Factor handling",
+                "Probability threshold", "Random seed"),
+  value = c("300", as.character(best_rf$mtry), as.character(best_rf$min.node.size),
+            "order", as.character(set.threshold), "448")
+)
+knitr::kable(rf_parameters, caption = "Selected random forest settings")
+
+rf_metrics <- model_comparison %>% filter(method == "Random forest")
+rf_metrics %>%
+  select(-method) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  knitr::kable(digits = 3, caption = "Random forest validation and test performance")
+```
+
+At the chosen threshold, the forest's test F1 is `r round(rf_metrics$test_f1, 3)`,
+with precision `r round(rf_metrics$test_precision, 3)` and recall
+`r round(rf_metrics$test_recall, 3)`. It flags
+`r round(100 * rf_metrics$test_alert_rate, 1)`% of test item rows as late. Its
+F1 should be considered alongside the always-late benchmark and the alert rate:
+maximizing F1 alone does not penalize excessive alerts in the same way as an
+operational limit on flagged orders.
+
+Permutation importance summarizes the fitted forest across its trees, whereas
+the split diagram shows only one tree. The importance values are based on
+out-of-bag item rows and are not measures of causal effects. In this fitted
+forest, `r rf_importance$feature[1]` has the largest permutation importance;
+correlated predictors can share or mask their individual importance.
+
+```{r random forest importance plot, fig.width=8, fig.height=4}
+ggplot(rf_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Random forest permutation importance",
+       x = "Predictor", y = "Out-of-bag permutation importance") +
+  theme_minimal()
+```
+
+```{r random forest tree rules}
+tree_number <- 1L
+tree_info <- ranger::treeInfo(rf_final, tree = tree_number)
+
+# With respect.unordered.factors = "order", ranger stores categories in a
+# model-specific order. Use that order to decode the numeric split value.
+tree_split_rule <- function(feature, split_value) {
+  category_order <- rf_final$forest$covariate.levels[[feature]]
+  if (!is.null(category_order)) {
+    left_levels <- category_order[seq_len(floor(split_value))]
+    paste0(feature, " is one of: ", paste(left_levels, collapse = ", "))
+  } else {
+    paste0(feature, " <= ", format(split_value, digits = 17, trim = TRUE))
+  }
+}
+
+# Recover each node's depth and position for the diagram.
+node_layout <- tibble(nodeID = 0L, depth = 0L, position = 0)
+for (node_id in tree_info$nodeID) {
+  node <- tree_info[tree_info$nodeID == node_id, , drop = FALSE]
+  parent <- node_layout %>% filter(nodeID == node_id)
+  stopifnot(nrow(parent) == 1)
+  if (!node$terminal) {
+    node_layout <- bind_rows(
+      node_layout,
+      tibble(nodeID = c(node$leftChild, node$rightChild),
+             depth = parent$depth + 1L,
+             position = c(2 * parent$position, 2 * parent$position + 1))
+    )
+  }
+}
+
+rf_tree_rules <- tree_info %>%
+  as_tibble() %>%
+  left_join(node_layout, by = "nodeID") %>%
+  filter(!terminal) %>%
+  mutate(
+    left_if = map2_chr(splitvarName, splitval, tree_split_rule),
+    right_if = paste("Otherwise (not missing after preprocessing)")
+  ) %>%
+  select(nodeID, depth, splitvarName, left_if, right_if, leftChild, rightChild)
+
+# Save every split rule; display the rules corresponding to the diagram below.
+dir.create("model_results", showWarnings = FALSE, recursive = TRUE)
+write.csv(rf_tree_rules, "model_results/random_forest_tree_1_rules.csv", row.names = FALSE)
+rf_tree_rules %>%
+  filter(depth < 2) %>%
+  knitr::kable(caption = "Tree 1: rules for the first two split levels")
+```
+
+For each displayed rule, follow the left branch when the condition is true and
+the right branch otherwise. The complete list for tree 1, including deeper
+splits, is saved as `model_results/random_forest_tree_1_rules.csv`. Terminal
+nodes show that individual tree's probability of late delivery; nodes marked
+"continued" have deeper splits omitted from the plot.
+
+```{r random forest tree plot, fig.width=9, fig.height=4.8}
+plot_nodes <- tree_info %>%
+  as_tibble() %>%
+  left_join(node_layout, by = "nodeID") %>%
+  left_join(rf_tree_rules %>% select(nodeID, left_if), by = "nodeID") %>%
+  filter(depth <= 2) %>%
+  mutate(
+    x = (position + 0.5) / (2^depth),
+    y = -depth,
+    label = if_else(terminal,
+                    paste0("Node ", nodeID, "\nLate probability: ",
+                           round(.data[["pred.1"]], 2)),
+                    if_else(depth == 2,
+                            paste0("Node ", nodeID, "\nContinued"),
+                            paste0("Node ", nodeID, "\n",
+                                   vapply(left_if, function(rule) {
+                                     if (is.na(rule)) return("")
+                                     paste(strwrap(rule, width = 29), collapse = "\n")
+                                   }, character(1)))))
+  )
+
+plot_edges <- plot_nodes %>%
+  filter(!terminal, depth < 2) %>%
+  select(parent = nodeID, x, y, leftChild, rightChild) %>%
+  pivot_longer(c(leftChild, rightChild), names_to = "branch", values_to = "child") %>%
+  left_join(plot_nodes %>% select(child = nodeID, xend = x, yend = y), by = "child") %>%
+  mutate(branch = if_else(branch == "leftChild", "True", "False"))
+
+rf_tree_plot <- ggplot() +
+  geom_segment(data = plot_edges, aes(x = x, y = y, xend = xend, yend = yend),
+               colour = "grey45") +
+  geom_label(data = plot_edges,
+             aes(x = (x + xend) / 2, y = (y + yend) / 2, label = branch),
+             size = 3, linewidth = 0, fill = "white") +
+  geom_label(data = plot_nodes, aes(x = x, y = y, label = label),
+             fill = "aliceblue", linewidth = 0.3, size = 3.2) +
+  scale_x_continuous(limits = c(-0.12, 1.12)) +
+  scale_y_continuous(limits = c(-2.3, 0.3)) +
+  labs(title = "Random forest: illustrative tree 1",
+       subtitle = "First two split levels; true goes left") +
+  theme_void()
+
+rf_tree_plot
+ggsave("model_results/random_forest_tree_1.png", rf_tree_plot,
+       width = 9, height = 4.8, dpi = 150, bg = "white")
+```
