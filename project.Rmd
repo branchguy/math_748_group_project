@@ -16,6 +16,9 @@ In modern supply chain management, late deliveries and unprofitable orders repre
 ```{r setupkaggle, include=FALSE, echo=FALSE}
 library(RKaggle)
 library(rstatix)
+library(glmnet)
+library(gbm)
+library(ranger)
 library(dplyr)
 library(zeallot)
 library(purrr)
@@ -23,6 +26,8 @@ library(lubridate)
 library(ggplot2)
 library(tidyr)
 library(forcats)
+library(caret)
+library(pROC)
 ```
 
 To get RKaggle to pull dataset automatically:
@@ -121,12 +126,26 @@ df <- df %>%
 
 str(df)
 ```
-### Step 4. Unnecessary Variables
+### Step 4. Unnecessary Variables and rows
 ```{r var select}
-unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
+unnecessary_vars <- c(
+  "Customer Email", 
+  "Customer Password", 
+  "Customer Fname", 
+  "Customer Lname", 
+  "Customer Street", 
+  "Product Image", 
+  "Product Description", 
+  "Product Status", 
+  "Delivery Status", # leak
+  "Days for shipping (real)" # leak
+  )
 
-df_clean <- df %>%
+df_clean <- df %>% filter(`Delivery Status` != "Shipping canceled") %>%
   select(-any_of(unnecessary_vars))
+
+# df_clean <- read.csv("DataCo_cleaned.csv")
+
 head(df_clean)
 ```
 
@@ -152,7 +171,7 @@ paste("Distinct Sites: ", df_clean %>% select(Latitude, Longitude) %>% distinct 
 ### Late_delivery_risk
 
 ```{r eda}
-top_ten <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
+top_ten_num <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
 
 top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer Segment", "Department Name", "Market", "Order City", "Order Country", "Order Region", "Order State", "Product Name", "Shipping Mode")
@@ -168,7 +187,7 @@ top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer
 
 
 df_clean %>% 
-  select(top_ten) %>% 
+  select(top_ten_num) %>% 
   pivot_longer(cols = everything(), names_to = "variable", values_to = "value") %>%
   ggplot(aes(x = value)) +
   geom_histogram(bins = 20, fill = "royalblue", color = "white") +
@@ -218,7 +237,7 @@ df_clean %>%
 
 ```{r late_hist}
 df_clean %>%
-  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  pivot_longer(cols = top_ten_num, names_to = "predictor", values_to = "x_value") %>%
   ggplot(aes(x = x_value, fill = Late_delivery_risk)) +
   geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
   facet_wrap(~ predictor, scales = "free_x", ncol = 4) + # 10 distinct plots
@@ -260,7 +279,7 @@ df_clean %>%
       labels = c("Very Low", "Low", "High", "Very High")
     )
   ) %>%
-  pivot_longer(cols = top_ten, names_to = "predictor", values_to = "x_value") %>%
+  pivot_longer(cols = top_ten_num, names_to = "predictor", values_to = "x_value") %>%
   ggplot(aes(x = x_value, fill = benefit_per_order_group)) +
   geom_histogram(bins = 20, position = "stack", alpha = 0.7, color = "black") +
   facet_wrap(~ predictor, scales = "free_x", ncol = 4) +
@@ -272,27 +291,1052 @@ df_clean %>%
 
 ```{r late_cor}
 df_clean %>% 
-  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten_num) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
   cor_mat
 ```
 
 ```{r bene_cor}
 df_clean %>% filter(`Product Price` > 1000) %>% 
-  select(Late_delivery_risk, `Benefit per order`, top_ten) %>% 
+  select(Late_delivery_risk, `Benefit per order`, top_ten_num) %>% 
   mutate(Late_delivery_risk = as.numeric(Late_delivery_risk)) %>% 
   cor_mat
 ```
 
-### Classification Regression
+## Analysis
 
-```{r regression}
+```{r preprocessing helper functions}
+# ideas 
+# top_ten_num <- c("Days for shipment (scheduled)","Sales per customer", "Latitude", "Longitude", "Order Item Discount", 
+#   "Order Item Discount Rate", "Order Item Product Price", "Order Item Profit Ratio", "Order Item Quantity", "Order Item Total")
 
-df_clean %>% summarise(across(everything(), n_distinct))
-usable_cat = c("Category Name", "Customer State", "Department Name", "Market", "Order Region", "Shipping Mode")
-predictors = c(top_ten, top_ten_cat)
-safe_top_ten <- paste0("`", usable_cat, "`")
-lm.fit <- glm(reformulate(safe_top_ten, response="Late_delivery_risk"), data=df_clean, family = binomial(link = "logit"))
-summary(lm.fit)
+# top_ten_cat <- c("Category Name", "Customer City", "Customer Country", "Customer Segment", "Department Name", "Market", "Order City", "Order Country", "Order Region", "Order State", "Product Name", "Shipping Mode")
+
+# some useful predictors to start with
+num <- c(
+  "Days for shipment (scheduled)", 
+  "Order Item Profit Ratio")
+
+catvars <- c(
+  "Shipping Mode",
+  "Market",
+  "Order Region",
+  "Category Name",
+  "Customer Country"
+)
+
+
+predictors <- c(num, catvars)
+
+
+learn_prep <- function(a) {
+
+  med <- sapply(
+    a[, num, drop = FALSE],
+    function(z) median(z[is.finite(z)])
+  )
+
+  lev <- lapply(
+    a[, catvars, drop = FALSE],
+    function(z) sort(unique(z[!is.na(z) & nzchar(z)]))
+  )
+
+  modes <- sapply(a[, catvars, drop = FALSE], function(z) {
+    z <- z[!is.na(z) & nzchar(z)]
+    names(sort(table(z), decreasing = TRUE))[1]
+  })
+
+  stopifnot(all(is.finite(med)), all(lengths(lev) >= 2))
+
+  list(med = med, lev = lev, modes = modes)
+}
+
+apply_prep <- function(a, p) {
+
+  x <- a[, predictors, drop = FALSE]
+
+  for (v in num) {
+    x[[v]][!is.finite(x[[v]])] <- p$med[[v]]
+  }
+
+  for (v in catvars) {
+    z <- x[[v]]
+    z[is.na(z) | !z %in% p$lev[[v]]] <- p$modes[[v]]
+    x[[v]] <- factor(z, levels = p$lev[[v]])
+  }
+
+  x
+}
+
+design <- function(x) model.matrix(~ ., x)
 ```
 
+### Validation Split
+
+> "Approximately 75% of the observations will be used for training, while the remaining 25% of data will be reserved for testing. We also plan to use 5 Fold Cross Validation on this dataset"
+
+Assuming that there are multiple items within an order, lets check if items within order can have mixed values for being late or not. If so, we will need to aggregate the data to the order level for classification.
+
+```{r inspect order and items relationship}
+
+df_clean %>% group_by(Late_delivery_risk, `Order Id`, `Order Item Id`) %>%
+  summarise(n = n()) %>% 
+  # then group by frequency
+  ungroup() %>%
+  group_by(n) %>% count()
+
+df_clean %>% distinct(`Order Id`) %>% count()
+df_clean %>% count()
+# how many items per order
+df_clean %>% group_by(`Order Id`) %>% count() %>% ungroup() %>% 
+  group_by(n) %>% count() %>% ungroup() %>% 
+  mutate(percent = n / sum(n) * 100)
+```
+
+Ok so we can see that only the `Order Id` recieves a `Late_delivery_risk` value of 1 or 0, so we would like to use the `Order Id` as basic unit in validation. This makes sense because orders should get shipped together. Next lets check dictinct item columns when we aggregate by `Order Id`.
+
+```{r check order id}
+df_clean %>% 
+  # sample some rows to test
+  slice_sample(n = 100) %>%
+  # group by Order id and summarize the numerical and categorical predictors
+  summarise(
+    n_rows = n(),
+    n_late_values = n_distinct(Late_delivery_risk),
+    n_shipping_modes = n_distinct(`Shipping Mode`),
+    n_regions = n_distinct(`Order Region`),
+    n_categories = n_distinct(`Category Name`),
+    .groups = "drop"
+  ) %>%
+  # now count the number of distinct rows for each column per order id
+  summarise(
+    orders = n(),
+    mixed_late_labels = sum(n_late_values > 1),
+    mixed_shipping_modes = sum(n_shipping_modes > 1),
+    mixed_regions = sum(n_regions > 1),
+    mixed_categories = sum(n_categories > 1)
+  )
+```
+
+It seems like this gets complicated, not only on the numerical aggregation but also on the categorical aggregation. For example, if we have multiple items of with different qualities and unique item categories we have no way to summarize that. We will have to use the item level data for our analysis and acknowledge the implications on our final results. Instead lets change the validation split to be based on the `Order Id` instead of the item level data. This way we can ensure that all items within an order are either in the training or testing set.
+
+```{r validation split}
+set.seed(1)
+
+
+order_ids <- df_clean %>% distinct(`Order Id`)
+
+train_idx <- sample(order_ids$`Order Id`, size = round(0.75 * length(order_ids$`Order Id`)))
+train <- df_clean[df_clean$`Order Id` %in% train_idx, ]
+test <- df_clean[!df_clean$`Order Id` %in% train_idx, ]
+
+# Stop early if a name is misspelled or missing.
+stopifnot(all(predictors %in% names(train)))
+
+# helper expects character categories
+train <- train %>%
+  mutate(across(all_of(catvars), as.character))
+
+
+```
+
+### Response Variable: `Late_delivery_risk`
+
+#### Classification Regression (Method 1)
+
+Notes: added in some of the top ten numerical predictors but didn't find anything useful outside of item profit ratio which didn't help
+
+```{r cross validation five-fold}
+
+# setup 5-fold cross validation
+k <- 5
+order_labels <- train %>% distinct(`Order Id`, Late_delivery_risk)
+fold_map <- order_labels %>% 
+  group_by(Late_delivery_risk) %>%
+  mutate(fold = sample(rep(1:k, length.out = n()))) %>% 
+  ungroup() %>%
+  select(`Order Id`, fold)
+
+train_cv <- train %>% left_join(fold_map, by = "Order Id")
+# every fold should have no NA and one row per order id
+
+run_logistic_fold <- function(k, data) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep) %>% 
+    mutate(Late_delivery_risk = train_fold$Late_delivery_risk)
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  mf <- reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk")
+  log.fit <- glm(mf, data=train_prepped, family = binomial)
+
+  return(
+    tibble(
+      fold = k, 
+      order_id = validation_fold$`Order Id`,
+      gold = as.character(validation_fold$Late_delivery_risk),
+      probability = as.numeric(
+        predict(log.fit, newdata=validation_prepped, type="response")
+      )
+    )
+  )
+}
+
+cv_predictions <- map_dfr(
+  1:k,
+  ~ run_logistic_fold(.x, train_cv)
+)
+
+```
+
+Now we score each fold and calculate the overall accuracy, precision, recall, and F1 score, AUC, AIC and ROC curve.
+
+```{r logistic regression scoring}
+
+score_fold <- function(data, threshold = 0.5) {
+  gold <- factor(data$gold, levels = c("0", "1"))
+  preds <- factor(ifelse(data$probability > threshold, "1", "0"), levels = c("0", "1"))
+  cm <- confusionMatrix(data=preds, reference=gold, positive = "1")
+  roc_obj <- roc(response = gold, predictor = data$probability, levels = c("0", "1"), direction = "<", quiet = TRUE)
+  
+  return(
+    tibble(
+      accuracy = cm$overall["Accuracy"],
+      precision = cm$byClass["Precision"],
+      recall = cm$byClass["Recall"],
+      f1 = cm$byClass["F1"],
+      roc_auc = as.numeric(auc(roc_obj)),
+      roc_obj = list(roc_obj)
+    )
+  )
+}
+# set.threshold <- 0.5
+set.threshold <- 0.4
+
+# take the mean across folds
+cv_predictions %>% 
+  group_by(fold) %>%
+  ggplot(aes(x = probability, fill = gold)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  facet_wrap(~ fold, ncol = 1) +
+  labs(title = "Predicted Probabilities by Fold", x = "Predicted Probability", y = "Count") +
+  theme_minimal()
+
+
+cv_predictions %>%
+  # 1. Assign each probability to one of 30 bins
+  mutate(bin = cut(probability, breaks = seq(0, 1, length.out = 31), include.lowest = TRUE)) %>%
+  # 2. Count observations per fold, class, and bin (fill missing bins with 0)
+  count(fold, gold, bin, .drop = FALSE) %>%
+  # 3. Average the counts across folds
+  group_by(gold, bin) %>%
+  summarise(mean_count = mean(n), .groups = "drop") %>%
+  # 4. Extract numeric bin midpoints for a clean x-axis
+  mutate(bin_mid = (as.numeric(bin) - 0.5) / 30) %>%
+  # 5. Plot the averaged histogram
+  ggplot(aes(x = bin_mid, y = mean_count, fill = gold)) +
+  geom_col(position = "identity", alpha = 0.5, width = 1/30) +
+  labs(
+    title = "Mean Predicted Probabilities Across Folds",
+    x = "Predicted Probability",
+    y = "Mean Count"
+  ) +
+  theme_minimal() +
+  ggsave("probability_cluster.png", width=6, height=3, units = "in")
+
+cv_scores <- cv_predictions %>%
+  group_by(fold) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+# check thresholds between 0.375 and 0.425 in steps of 0.0025 to see if we can improve the F1 score
+threshold_values <- seq(0.375, 0.425, by = 0.0025)
+
+threshold_scores <- map_dfr(threshold_values, function(threshold) {
+  cv_predictions %>%
+    group_by(fold) %>%
+    group_modify(~ score_fold(.x, threshold = threshold)) %>%
+    ungroup() %>%
+    mutate(threshold = threshold, .before = 1)
+})
+
+threshold_summary <- threshold_scores %>%
+  group_by(threshold) %>%
+  summarise(across(
+    c(accuracy, precision, recall, f1, roc_auc),
+    list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+  ), .groups = "drop")
+
+# plot all values vs threshold on x axis
+threshold_summary %>% 
+  pivot_longer(cols = c(accuracy_mean, precision_mean, recall_mean, f1_mean, roc_auc_mean), names_to = "metric", values_to = "mean_score") %>%
+  ggplot(aes(x = threshold, y = mean_score, color = metric)) +
+  geom_point(size = 2) +
+  geom_line(size = 1) +
+  labs(
+    title = "Mean Scores vs Threshold",
+    x = "Threshold",
+    y = "Mean Score",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+  )
+
+cv_scores
+
+cv_scores %>% summarise(across(
+  c(accuracy, precision, recall, f1, roc_auc), list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+)) %>% 
+  pivot_longer(
+    cols = everything(), 
+    names_to = c("metric", ".value"), 
+    names_pattern = "(.*)_(.*)") %>%
+  select(metric, mean, sd)
+
+
+# Overlay all ROC curves from each fold
+roc_curves <- function(all_scores) {
+  fold_rocs <- all_scores %>% pull(roc_obj)
+  # use ggplot for ROC curves
+  ggroc(fold_rocs, legacy.axes = TRUE) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", color = "gray60") +
+    annotate("text", x = 0.70, y = 0.25,
+            label = paste("Mean AUC =", round(mean(map_dbl(fold_rocs, auc)), 2)),
+            size = 5, fontface = "bold", color = "#2C3E50"
+    ) +
+    labs(
+      title = "ROC Curves for Each Fold",
+      x = "False Positive Rate (1 - Specificity)",
+      y = "True Positive Rate (Sensitivity)",
+      colour = "Fold"
+    ) +
+    coord_equal() +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      panel.grid.minor = element_blank(),
+      panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+    )
+}
+
+roc_curves(cv_scores)
+
+```
+
+It seems like with a threshold of $0.5$, the mean accuracy sits around $0.712$ and and the precision around $0.84$. However, recall is lower around $0.56$ which means that we are missing a lot of late delivery risk orders and the F1 captures this. The AUC is around $0.72$ which is decent but not great. We can notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable \-\-\> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk` (note: this is not always the case)
+
+
+When exploring changing the threshold we found that between 0.375 and 0.425 lies one of three gaussian distributions of predicted probabilities. We can see that in the plot describing the mean scores vs theshold value where F1 is higher for a recall heavy model (i.e. flagging everything as late)
+
+#### Lasso Regression (Method 2)
+
+```{r lasso cross validation folds}
+
+run_lasso_fold <- function(k, data, lambda_values) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep)
+  train_prepped <- design(train_prepped)[, -1, drop = FALSE]
+  validation_prepped <- apply_prep(validation_fold, prep)
+  validation_prepped <- design(validation_prepped)[, -1, drop = FALSE]
+  
+  # fit lasso for mulitple lambda params
+  lasso.fit <- glmnet(
+    x = train_prepped, 
+    y = as.integer(as.character(train_fold$Late_delivery_risk)), 
+    family = "binomial",
+    alpha = 1,
+    lambda = lambda_values
+  )
+
+  map_dfr(
+    seq_along(lambda_values),
+    function(i) {
+      tibble(
+        fold = k, 
+        lambda = lambda_values[i],
+        order_id = validation_fold$`Order Id`,
+        gold = as.character(validation_fold$Late_delivery_risk),
+        probability = as.numeric(
+          predict(lasso.fit, newx=validation_prepped, type="response", s=lambda_values[i])
+        )
+      )
+    }
+  )
+}
+
+grid_search_lambda <- 10^seq(-4, 0, length.out = 100)
+lasso_cv_predictions <- map_dfr(
+  1:k,
+  ~ run_lasso_fold(.x, train_cv, grid_search_lambda)
+)
+```
+
+```{r lasso regression late delivery risk}
+
+lasso_scores <- lasso_cv_predictions %>%
+  group_by(fold, lambda) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+
+# lasso_summary <- lasso_scores %>% 
+#   group_by(lambda) %>%
+#   summarise(across(
+#     c(accuracy, precision, recall, f1, roc_auc), 
+#     list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+#   )) %>%
+#   ungroup()
+
+lasso_summary <- lasso_scores %>%
+  group_by(lambda) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+lasso_summary %>% print(n = 100)
+
+### A plot of the mean F1 score and mean AUC score against lambda values to visualize the trade-off between model complexity and performance.
+lasso_summary %>%
+  pivot_longer(cols = c(mean_f1, mean_roc_auc), names_to = "metric", values_to = "mean_score") %>%
+  ggplot(aes(x = log10(lambda), y = mean_score, color = metric)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Mean F1 Score and Mean AUC Score vs Log10(Lambda)",
+    x = "Log10(Lambda)",
+    y = "Mean Score",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+  )
+
+```
+
+Observing the lasso regression results it seems like we collapse to predicting late for everything as lambda approaches $1$. So the best lambda will likely be around the maximum AUC-ROC value
+
+```{r best lambda}
+best_lambda <- lasso_summary %>% arrange(desc(mean_roc_auc), desc(mean_f1), desc(lambda)) %>% slice(1)%>% pull(lambda)
+
+best_lambda
+
+```
+
+
+#### Random Forest (Method 3)
+
+```{r}
+
+rf_param_grid <- expand.grid(
+  mtry = c(2L, 4L, 7L),
+  min.node.size = c(25L, 100L)
+)
+
+run_rf_fold <- function(k, data, mtry, min_node) {
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  # preprocess the training data incase there are any missing values or new levels in the validation set
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep)
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  rf.fit <- ranger(
+    x = train_prepped,
+    y = factor(as.character(train_fold$Late_delivery_risk), levels = c("0", "1")),
+    data = train_prepped,
+    mtry = mtry,
+    min.node.size = min_node,
+    probability = TRUE,
+    num.trees = 300,
+    respect.unordered.factors = "order",
+    num.threads = 2
+  )
+
+  return(
+    tibble(
+      fold = k,
+      mtry = mtry,
+      min.node.size = min_node,
+      order_id = validation_fold$`Order Id`,
+      gold = as.character(validation_fold$Late_delivery_risk),
+      probability = as.numeric(
+        predict(rf.fit, data = validation_prepped)$predictions[, "1"]
+      )
+    )
+  )
+}
+set.seed(1)
+
+# takes a while about 3-5 mins
+rf_cv_preds <- map_dfr(
+  seq_len(nrow(rf_param_grid)),
+  function(i) {
+    map_dfr(
+      1:k,
+      ~ run_rf_fold(.x, train_cv, rf_param_grid$mtry[i], rf_param_grid$min.node.size[i])
+    )
+  }
+)
+
+```
+
+Get the results out
+
+```{r}
+
+rf_scores <- rf_cv_preds %>%
+  group_by(fold, mtry, min.node.size) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+
+rf_summary <- rf_scores %>%
+  group_by(mtry, min.node.size) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+
+rf_summary
+
+```
+
+
+#### Gradient Boosting (Method 4)
+
+```{r load}
+library(gbm)
+set.seed(1)
+#fit boosted regression tree
+#binary classification: distribution="bernoulli"
+#regression: distribution="gaussian"
+#more than two classes: "multinomial"
+#n.trees: number of trees (default 100)
+#interaction.depth=4 limits the depth of each tree (default 1)
+
+boost_param_grid <- expand.grid(
+  depth = c(1L, 3L),
+  rate = c(0.03, 0.10)
+)
+
+tree_param_grid <- c(100L, 300L, 600L)
+
+run_boost_fold <- function(k, data, depth, rate, tree_values) {
+
+  train_fold <- data %>% filter(fold != k)
+  validation_fold <- data %>% filter(fold == k)
+
+  prep <- learn_prep(train_fold)
+  train_prepped <- apply_prep(train_fold, prep) %>% 
+    mutate(Late_delivery_risk = as.integer(as.character(train_fold$Late_delivery_risk)))
+  validation_prepped <- apply_prep(validation_fold, prep)
+
+  model_formula <- reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk")
+
+  boost_fit <- gbm(
+    formula = reformulate(paste0("`", predictors, "`"), response = "Late_delivery_risk"),
+    data = train_prepped,
+    distribution = "bernoulli",
+    n.trees = max(tree_values),
+    interaction.depth = depth,
+    shrinkage = rate,
+    n.minobsinnode = 50,
+    bag.fraction = 0.8,
+    verbose = FALSE,
+    keep.data = FALSE,
+    n.cores = 1
+  )
+
+  map_dfr(
+    tree_values, function(num_trees) {
+      tibble(
+        fold = k,
+        depth = depth,
+        rate = rate,
+        n_trees = num_trees,
+        order_id = validation_fold$`Order Id`,
+        gold = as.character(validation_fold$Late_delivery_risk),
+        probability = as.numeric(
+          predict(
+            boost_fit,
+            newdata = validation_prepped,
+            n.trees = num_trees,
+            type = "response"
+          )
+        )
+      )
+    }
+  )
+}
+
+
+boost_cv_predictions <- map_dfr(
+  seq_len(nrow(boost_param_grid)),
+  function(i) {
+    map_dfr(
+      1:k,
+      ~ run_boost_fold(
+        k = .x,
+        data = train_cv,
+        depth = boost_param_grid$depth[i],
+        rate = boost_param_grid$rate[i],
+        tree_values = tree_param_grid
+      )
+    )
+  }
+)
+
+
+```
+
+Find results from CV gradient boosting
+
+```{r}
+boost_scores <- boost_cv_predictions %>%
+  group_by(fold, depth, rate, n_trees) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
+  ungroup()
+
+boost_summary <- boost_scores %>%
+  group_by(depth, rate, n_trees) %>%
+  summarise(
+    mean_f1 = mean(f1, na.rm = TRUE),
+    mean_roc_auc = mean(roc_auc, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_f1))
+
+boost_summary
+```
+
+### Feature importance for the selected classification models
+
+The following models are refitted on all training rows. Lasso uses the lambda
+selected above by cross-validation AUC; the random forest and gradient boosting
+use the settings with the highest mean cross-validation F1 score at the
+threshold used above.
+The test set is not used to select settings or calculate these importance
+measures. Since the models use item-level rows, orders with more rows can have
+more influence on the fitted models.
+
+```{r selected classification settings}
+# Resolve ties consistently and reject configurations with undefined scores.
+best_lasso <- lasso_summary %>%
+  filter(lambda == best_lambda)
+
+best_rf <- rf_summary %>%
+  filter(is.finite(mean_f1)) %>%
+  arrange(desc(mean_f1), mtry, desc(min.node.size)) %>%
+  slice(1)
+
+best_boost <- boost_summary %>%
+  filter(is.finite(mean_f1)) %>%
+  arrange(desc(mean_f1), depth, rate, n_trees) %>%
+  slice(1)
+
+
+best_lasso
+best_rf
+best_boost
+
+# Learn preprocessing again using all training data, not the test set.
+importance_prep <- learn_prep(train)
+importance_train <- apply_prep(train, importance_prep)
+importance_y <- factor(as.character(train$Late_delivery_risk), levels = c("0", "1"))
+```
+
+#### Lasso coefficients
+
+Lasso shrinks coefficients toward zero. The table shows nonzero coefficients on
+the log-odds scale, excluding the intercept. Categorical terms compare a level
+with its reference level; numeric terms describe a one-unit change. Coefficient
+magnitudes depend on predictor units and should not be treated as a direct
+ranking of whole features, particularly across categorical and numeric terms.
+
+```{r lasso feature importance}
+importance_matrix <- design(importance_train)[, -1, drop = FALSE]
+
+lasso_final <- glmnet(
+  x = importance_matrix,
+  y = as.integer(as.character(importance_y)),
+  family = "binomial",
+  alpha = 1,
+  lambda = grid_search_lambda
+)
+
+lasso_coef <- as.matrix(coef(lasso_final, s = best_lasso$lambda))
+lasso_importance <- tibble(
+  term = rownames(lasso_coef),
+  coefficient = as.numeric(lasso_coef[, 1])
+) %>%
+  filter(term != "(Intercept)", coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+lasso_importance
+```
+
+#### Random forest permutation importance
+
+This measures how much the forest's out-of-bag prediction error increases when
+each feature is shuffled. Larger values suggest greater reliance on that
+feature. Out-of-bag observations are sampled at the row level, so other rows
+from the same order can still be present in a tree's fitting sample.
+
+```{r random forest feature importance}
+set.seed(448)
+rf_final <- ranger(
+  x = importance_train,
+  y = importance_y,
+  probability = TRUE,
+  num.trees = 300,
+  mtry = best_rf$mtry,
+  min.node.size = best_rf$min.node.size,
+  respect.unordered.factors = "order",
+  importance = "permutation",
+  num.threads = 2
+)
+
+rf_importance <- tibble(
+  feature = names(rf_final$variable.importance),
+  importance = as.numeric(rf_final$variable.importance)
+) %>%
+  arrange(desc(importance))
+
+rf_importance
+```
+
+#### Gradient boosting relative influence
+
+Relative influence summarizes how much each feature contributed to splits in
+the fitted boosted trees. These values use a different definition from random
+forest permutation importance and are not directly comparable across models.
+
+```{r boosting feature importance}
+boost_train <- importance_train %>%
+  mutate(late = as.integer(as.character(importance_y)))
+boost_formula <- reformulate(paste0("`", predictors, "`"), response = "late")
+
+set.seed(1448)
+boost_final <- gbm(
+  formula = boost_formula,
+  data = boost_train,
+  distribution = "bernoulli",
+  n.trees = best_boost$n_trees,
+  interaction.depth = best_boost$depth,
+  shrinkage = best_boost$rate,
+  n.minobsinnode = 50,
+  bag.fraction = 0.8,
+  verbose = FALSE,
+  keep.data = FALSE,
+  n.cores = 1
+)
+
+boost_importance <- summary(boost_final, plotit = FALSE) %>%
+  as_tibble() %>%
+  rename(feature = var, relative_influence = rel.inf) %>%
+  arrange(desc(relative_influence))
+
+boost_importance
+```
+
+These importance measures describe model behavior and associations, not causal
+effects. Correlated predictors can share or mask importance.
+
+### Classification model comparison
+
+The table below reports mean validation-fold metrics for the selected settings.
+All classifiers use the threshold chosen above; the always-late benchmark flags
+every row regardless of the threshold. The training-prevalence benchmark uses
+the proportion of late rows in each fold's fitting data as a constant predicted
+probability. Constant predictions have an AUC of 0.5. Precision, recall, and
+the proportion flagged help assess whether a model raises too many alerts.
+
+These are item-row metrics, so orders with more rows have more weight. Threshold
+and model selection used these same folds, so the selected CV results may be
+optimistic. The held-out test scores are added after the selected models are
+refitted below.
+
+```{r classification comparison}
+# Each validation fold receives the late rate learned from the other folds.
+prevalence_predictions <- map_dfr(1:k, function(fold_num) {
+  fitting_rate <- train_cv %>%
+    filter(fold != fold_num) %>%
+    summarise(rate = mean(as.character(Late_delivery_risk) == "1")) %>%
+    pull(rate)
+
+  train_cv %>%
+    filter(fold == fold_num) %>%
+    transmute(
+      fold = fold_num,
+      gold = as.character(Late_delivery_risk),
+      probability = fitting_rate
+    )
+})
+
+always_late_predictions <- prevalence_predictions %>%
+  mutate(probability = 1)
+
+# Keep one set of validation predictions for each selected configuration.
+selected_lasso_predictions <- lasso_cv_predictions %>%
+  filter(lambda == best_lasso$lambda)
+selected_rf_predictions <- rf_cv_preds %>%
+  filter(mtry == best_rf$mtry, min.node.size == best_rf$min.node.size)
+selected_boost_predictions <- boost_cv_predictions %>%
+  filter(depth == best_boost$depth, rate == best_boost$rate,
+         n_trees == best_boost$n_trees)
+
+comparison_metrics <- function(predictions, method) {
+  fold_metrics <- predictions %>%
+    group_by(fold) %>%
+    group_modify(function(.x, .y) {
+      score_fold(.x, threshold = set.threshold) %>%
+        select(accuracy, precision, recall, f1, roc_auc) %>%
+        mutate(alert_rate = mean(.x$probability > set.threshold))
+    }) %>%
+    ungroup()
+
+  stopifnot(nrow(fold_metrics) == k, n_distinct(fold_metrics$fold) == k)
+
+  fold_metrics %>%
+    summarise(across(c(accuracy, precision, recall, f1, roc_auc, alert_rate), mean)) %>%
+    mutate(method = method, .before = 1)
+}
+
+model_comparison <- bind_rows(
+  comparison_metrics(prevalence_predictions, "Training prevalence benchmark"),
+  comparison_metrics(always_late_predictions, "Always-late benchmark"),
+  comparison_metrics(cv_predictions, "Logistic regression"),
+  comparison_metrics(selected_lasso_predictions, "Lasso logistic regression"),
+  comparison_metrics(selected_rf_predictions, "Random forest"),
+  comparison_metrics(selected_boost_predictions, "Gradient boosting")
+) %>%
+  rename(
+    cv_accuracy = accuracy,
+    cv_auc_roc = roc_auc,
+    cv_f1 = f1,
+    cv_precision = precision,
+    cv_recall = recall,
+    cv_alert_rate = alert_rate
+  ) %>%
+  select(method, cv_accuracy, cv_auc_roc, cv_f1, cv_precision, cv_recall, cv_alert_rate)
+
+model_comparison
+```
+
+### Held-out test evaluation
+
+The predictors, model settings, and classification threshold were selected
+using the training data. Apply the preprocessing learned from the full training
+set to the held-out orders, then score each refitted model and both benchmarks.
+These are item-row metrics; orders containing more rows have more weight.
+
+```{r classification test evaluation}
+stopifnot(!any(train$`Order Id` %in% test$`Order Id`))
+test_input <- test %>% mutate(across(all_of(catvars), as.character))
+test_prepped <- apply_prep(test_input, importance_prep)
+test_matrix <- design(test_prepped)[, -1, drop = FALSE]
+stopifnot(identical(colnames(importance_matrix), colnames(test_matrix)))
+
+# The other selected models were already refitted in the importance section.
+logistic_train <- importance_train %>% mutate(Late_delivery_risk = importance_y)
+logistic_formula <- reformulate(paste0("`", predictors, "`"),
+                               response = "Late_delivery_risk")
+logistic_final <- glm(logistic_formula, data = logistic_train, family = binomial())
+
+test_predictions <- tibble(
+  order_id = test$`Order Id`,
+  gold = as.character(test$Late_delivery_risk),
+  `Training prevalence benchmark` = mean(as.character(importance_y) == "1"),
+  `Always-late benchmark` = 1,
+  `Logistic regression` = as.numeric(predict(logistic_final, test_prepped, type = "response")),
+  `Lasso logistic regression` = as.numeric(predict(lasso_final, newx = test_matrix,
+                                                  s = best_lasso$lambda, type = "response")),
+  `Random forest` = as.numeric(predict(rf_final, data = test_prepped)$predictions[, "1"]),
+  `Gradient boosting` = as.numeric(predict(boost_final, newdata = test_prepped,
+                                           n.trees = best_boost$n_trees, type = "response"))
+)
+
+test_scores <- test_predictions %>%
+  pivot_longer(-c(order_id, gold), names_to = "method", values_to = "probability") %>%
+  group_by(method) %>%
+  group_modify(function(.x, .y) {
+    score_fold(.x, threshold = set.threshold) %>%
+      select(accuracy, precision, recall, f1, roc_auc) %>%
+      mutate(alert_rate = mean(.x$probability > set.threshold))
+  }) %>%
+  ungroup() %>%
+  rename_with(~ paste0("test_", .x), -method)
+
+model_comparison <- model_comparison %>% left_join(test_scores, by = "method")
+model_comparison
+```
+
+### Interpretation of the selected random forest
+
+We chose the random forest after reviewing the test comparison. Consequently,
+its test metrics are descriptive for this model choice; an additional untouched
+evaluation set would be needed for an independent estimate after selection. The
+forest averages probabilities from 300 trees, then flags a row as late when the
+average is greater than the selected threshold. The tree shown below is tree 1,
+chosen for illustration; it is not necessarily representative of the other
+trees or the complete forest. Only its first two split levels are plotted so
+that the diagram remains readable.
+
+```{r random forest parameters and performance}
+rf_parameters <- tibble(
+  parameter = c("Number of trees", "Predictors considered at each split (mtry)",
+                "Minimum node size for splitting", "Factor handling",
+                "Probability threshold", "Random seed"),
+  value = c("300", as.character(best_rf$mtry), as.character(best_rf$min.node.size),
+            "order", as.character(set.threshold), "448")
+)
+knitr::kable(rf_parameters, caption = "Selected random forest settings")
+
+rf_metrics <- model_comparison %>% filter(method == "Random forest")
+rf_metrics %>%
+  select(-method) %>%
+  pivot_longer(everything(), names_to = "metric", values_to = "value") %>%
+  knitr::kable(digits = 3, caption = "Random forest validation and test performance")
+```
+
+At the chosen threshold, the forest's test F1 is `r round(rf_metrics$test_f1, 3)`,
+with precision `r round(rf_metrics$test_precision, 3)` and recall
+`r round(rf_metrics$test_recall, 3)`. It flags
+`r round(100 * rf_metrics$test_alert_rate, 1)`% of test item rows as late. Its
+F1 should be considered alongside the always-late benchmark and the alert rate:
+maximizing F1 alone does not penalize excessive alerts in the same way as an
+operational limit on flagged orders.
+
+Permutation importance summarizes the fitted forest across its trees, whereas
+the split diagram shows only one tree. The importance values are based on
+out-of-bag item rows and are not measures of causal effects. In this fitted
+forest, `r rf_importance$feature[1]` has the largest permutation importance;
+correlated predictors can share or mask their individual importance.
+
+```{r random forest importance plot, fig.width=8, fig.height=4}
+ggplot(rf_importance, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Random forest permutation importance",
+       x = "Predictor", y = "Out-of-bag permutation importance") +
+  theme_minimal()
+```
+
+```{r random forest tree rules}
+tree_number <- 1L
+tree_info <- ranger::treeInfo(rf_final, tree = tree_number)
+
+# With respect.unordered.factors = "order", ranger stores categories in a
+# model-specific order. Use that order to decode the numeric split value.
+tree_split_rule <- function(feature, split_value) {
+  category_order <- rf_final$forest$covariate.levels[[feature]]
+  if (!is.null(category_order)) {
+    left_levels <- category_order[seq_len(floor(split_value))]
+    paste0(feature, " is one of: ", paste(left_levels, collapse = ", "))
+  } else {
+    paste0(feature, " <= ", format(split_value, digits = 17, trim = TRUE))
+  }
+}
+
+# Recover each node's depth and position for the diagram.
+node_layout <- tibble(nodeID = 0L, depth = 0L, position = 0)
+for (node_id in tree_info$nodeID) {
+  node <- tree_info[tree_info$nodeID == node_id, , drop = FALSE]
+  parent <- node_layout %>% filter(nodeID == node_id)
+  stopifnot(nrow(parent) == 1)
+  if (!node$terminal) {
+    node_layout <- bind_rows(
+      node_layout,
+      tibble(nodeID = c(node$leftChild, node$rightChild),
+             depth = parent$depth + 1L,
+             position = c(2 * parent$position, 2 * parent$position + 1))
+    )
+  }
+}
+
+rf_tree_rules <- tree_info %>%
+  as_tibble() %>%
+  left_join(node_layout, by = "nodeID") %>%
+  filter(!terminal) %>%
+  mutate(
+    left_if = map2_chr(splitvarName, splitval, tree_split_rule),
+    right_if = paste("Otherwise (not missing after preprocessing)")
+  ) %>%
+  select(nodeID, depth, splitvarName, left_if, right_if, leftChild, rightChild)
+
+# Save every split rule; display the rules corresponding to the diagram below.
+dir.create("model_results", showWarnings = FALSE, recursive = TRUE)
+write.csv(rf_tree_rules, "model_results/random_forest_tree_1_rules.csv", row.names = FALSE)
+rf_tree_rules %>%
+  filter(depth < 2) %>%
+  knitr::kable(caption = "Tree 1: rules for the first two split levels")
+```
+
+For each displayed rule, follow the left branch when the condition is true and
+the right branch otherwise. The complete list for tree 1, including deeper
+splits, is saved as `model_results/random_forest_tree_1_rules.csv`. Terminal
+nodes show that individual tree's probability of late delivery; nodes marked
+"continued" have deeper splits omitted from the plot.
+
+```{r random forest tree plot, fig.width=9, fig.height=4.8}
+plot_nodes <- tree_info %>%
+  as_tibble() %>%
+  left_join(node_layout, by = "nodeID") %>%
+  left_join(rf_tree_rules %>% select(nodeID, left_if), by = "nodeID") %>%
+  filter(depth <= 2) %>%
+  mutate(
+    x = (position + 0.5) / (2^depth),
+    y = -depth,
+    label = if_else(terminal,
+                    paste0("Node ", nodeID, "\nLate probability: ",
+                           round(.data[["pred.1"]], 2)),
+                    if_else(depth == 2,
+                            paste0("Node ", nodeID, "\nContinued"),
+                            paste0("Node ", nodeID, "\n",
+                                   vapply(left_if, function(rule) {
+                                     if (is.na(rule)) return("")
+                                     paste(strwrap(rule, width = 29), collapse = "\n")
+                                   }, character(1)))))
+  )
+
+plot_edges <- plot_nodes %>%
+  filter(!terminal, depth < 2) %>%
+  select(parent = nodeID, x, y, leftChild, rightChild) %>%
+  pivot_longer(c(leftChild, rightChild), names_to = "branch", values_to = "child") %>%
+  left_join(plot_nodes %>% select(child = nodeID, xend = x, yend = y), by = "child") %>%
+  mutate(branch = if_else(branch == "leftChild", "True", "False"))
+
+rf_tree_plot <- ggplot() +
+  geom_segment(data = plot_edges, aes(x = x, y = y, xend = xend, yend = yend),
+               colour = "grey45") +
+  geom_label(data = plot_edges,
+             aes(x = (x + xend) / 2, y = (y + yend) / 2, label = branch),
+             size = 3, linewidth = 0, fill = "white") +
+  geom_label(data = plot_nodes, aes(x = x, y = y, label = label),
+             fill = "aliceblue", linewidth = 0.3, size = 3.2) +
+  scale_x_continuous(limits = c(-0.12, 1.12)) +
+  scale_y_continuous(limits = c(-2.3, 0.3)) +
+  labs(title = "Random forest: illustrative tree 1",
+       subtitle = "First two split levels; true goes left") +
+  theme_void()
+
+rf_tree_plot
+ggsave("model_results/random_forest_tree_1.png", rf_tree_plot,
+       width = 9, height = 4.8, dpi = 150, bg = "white")
+```
