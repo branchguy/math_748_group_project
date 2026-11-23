@@ -128,7 +128,18 @@ str(df)
 ```
 ### Step 4. Unnecessary Variables and rows
 ```{r var select}
-unnecessary_vars <- c(  "Customer Email", "Customer Password", "Customer Fname", "Customer Lname", "Customer Street", "Product Image", "Product Description", "Product Status", "Delivery Status", "Days for shipping (real)")
+unnecessary_vars <- c(
+  "Customer Email", 
+  "Customer Password", 
+  "Customer Fname", 
+  "Customer Lname", 
+  "Customer Street", 
+  "Product Image", 
+  "Product Description", 
+  "Product Status", 
+  "Delivery Status", # leak
+  "Days for shipping (real)" # leak
+  )
 
 df_clean <- df %>% filter(`Delivery Status` != "Shipping canceled") %>%
   select(-any_of(unnecessary_vars))
@@ -502,12 +513,81 @@ score_fold <- function(data, threshold = 0.5) {
     )
   )
 }
-set.threshold <- 0.5
+# set.threshold <- 0.5
+set.threshold <- 0.4
+
+# take the mean across folds
+cv_predictions %>% 
+  group_by(fold) %>%
+  ggplot(aes(x = probability, fill = gold)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  facet_wrap(~ fold, ncol = 1) +
+  labs(title = "Predicted Probabilities by Fold", x = "Predicted Probability", y = "Count") +
+  theme_minimal()
+
+
+cv_predictions %>%
+  # 1. Assign each probability to one of 30 bins
+  mutate(bin = cut(probability, breaks = seq(0, 1, length.out = 31), include.lowest = TRUE)) %>%
+  # 2. Count observations per fold, class, and bin (fill missing bins with 0)
+  count(fold, gold, bin, .drop = FALSE) %>%
+  # 3. Average the counts across folds
+  group_by(gold, bin) %>%
+  summarise(mean_count = mean(n), .groups = "drop") %>%
+  # 4. Extract numeric bin midpoints for a clean x-axis
+  mutate(bin_mid = (as.numeric(bin) - 0.5) / 30) %>%
+  # 5. Plot the averaged histogram
+  ggplot(aes(x = bin_mid, y = mean_count, fill = gold)) +
+  geom_col(position = "identity", alpha = 0.5, width = 1/30) +
+  labs(
+    title = "Mean Predicted Probabilities Across Folds",
+    x = "Predicted Probability",
+    y = "Mean Count"
+  ) +
+  theme_minimal() +
+  ggsave("probability_cluster.png", width=6, height=3, units = "in")
 
 cv_scores <- cv_predictions %>%
   group_by(fold) %>%
   group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
   ungroup()
+# check thresholds between 0.375 and 0.425 in steps of 0.0025 to see if we can improve the F1 score
+threshold_values <- seq(0.375, 0.425, by = 0.0025)
+
+threshold_scores <- map_dfr(threshold_values, function(threshold) {
+  cv_predictions %>%
+    group_by(fold) %>%
+    group_modify(~ score_fold(.x, threshold = threshold)) %>%
+    ungroup() %>%
+    mutate(threshold = threshold, .before = 1)
+})
+
+threshold_summary <- threshold_scores %>%
+  group_by(threshold) %>%
+  summarise(across(
+    c(accuracy, precision, recall, f1, roc_auc),
+    list(mean = ~mean(.x, na.rm = TRUE), sd = ~sd(.x, na.rm = TRUE))
+  ), .groups = "drop")
+
+# plot all values vs threshold on x axis
+threshold_summary %>% 
+  pivot_longer(cols = c(accuracy_mean, precision_mean, recall_mean, f1_mean, roc_auc_mean), names_to = "metric", values_to = "mean_score") %>%
+  ggplot(aes(x = threshold, y = mean_score, color = metric)) +
+  geom_point(size = 2) +
+  geom_line(size = 1) +
+  labs(
+    title = "Mean Scores vs Threshold",
+    x = "Threshold",
+    y = "Mean Score",
+    color = "Metric"
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
+  )
+
 cv_scores
 
 cv_scores %>% summarise(across(
@@ -550,10 +630,10 @@ roc_curves(cv_scores)
 
 ```
 
-It seems like with a threshold of $0.5$, the mean accuracy sits around $0.712$ and and the precision around $0.84$. However, recall is lower around $0.56$ which means that we are missing a lot of late delivery risk orders and the F1 captures this. The AUC is around $0.72$ which is decent but not great. We can notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable \-\-\> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk`
- 
- note: this is not always the case
+It seems like with a threshold of $0.5$, the mean accuracy sits around $0.712$ and and the precision around $0.84$. However, recall is lower around $0.56$ which means that we are missing a lot of late delivery risk orders and the F1 captures this. The AUC is around $0.72$ which is decent but not great. We can notice that the roc curve has these kinks / segments which can be caused by the categorical model dependent on a set of categories, instead of a continuous variable \-\-\> i.e. fitting on categorical variables, we didn't find our top ten variables to be useful for predicting `Late_delivery_risk` (note: this is not always the case)
 
+
+When exploring changing the threshold we found that between 0.375 and 0.425 lies one of three gaussian distributions of predicted probabilities. We can see that in the plot describing the mean scores vs theshold value where F1 is higher for a recall heavy model (i.e. flagging everything as late)
 
 #### Lasso Regression (Method 2)
 
@@ -606,7 +686,7 @@ lasso_cv_predictions <- map_dfr(
 
 lasso_scores <- lasso_cv_predictions %>%
   group_by(fold, lambda) %>%
-  group_modify(~ score_fold(.x, threshold = 0.5)) %>%
+  group_modify(~ score_fold(.x, threshold = set.threshold)) %>%
   ungroup()
 
 # lasso_summary <- lasso_scores %>% 
@@ -644,6 +724,15 @@ lasso_summary %>%
     panel.grid.minor = element_blank(),
     panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8)
   )
+
+```
+
+Observing the lasso regression results it seems like we collapse to predicting late for everything as lambda approaches $1$. So the best lambda will likely be around the maximum AUC-ROC value
+
+```{r best lambda}
+best_lambda <- lasso_summary %>% arrange(desc(mean_roc_auc), desc(mean_f1), desc(lambda)) %>% slice(1)%>% pull(lambda)
+
+best_lambda
 
 ```
 
@@ -838,8 +927,10 @@ boost_summary
 
 ### Feature importance for the selected classification models
 
-The following models are refitted on all training rows using the tuning settings
-with the highest mean cross-validation F1 score at the threshold used above.
+The following models are refitted on all training rows. Lasso uses the lambda
+selected above by cross-validation AUC; the random forest and gradient boosting
+use the settings with the highest mean cross-validation F1 score at the
+threshold used above.
 The test set is not used to select settings or calculate these importance
 measures. Since the models use item-level rows, orders with more rows can have
 more influence on the fitted models.
@@ -847,9 +938,7 @@ more influence on the fitted models.
 ```{r selected classification settings}
 # Resolve ties consistently and reject configurations with undefined scores.
 best_lasso <- lasso_summary %>%
-  filter(is.finite(mean_f1)) %>%
-  arrange(desc(mean_f1), desc(lambda)) %>%
-  slice(1)
+  filter(lambda == best_lambda)
 
 best_rf <- rf_summary %>%
   filter(is.finite(mean_f1)) %>%
@@ -968,6 +1057,87 @@ boost_importance
 
 These importance measures describe model behavior and associations, not causal
 effects. Correlated predictors can share or mask importance.
+
+### Classification model comparison
+
+The table below reports mean validation-fold metrics for the selected settings.
+All classifiers use the threshold chosen above; the always-late benchmark flags
+every row regardless of the threshold. The training-prevalence benchmark uses
+the proportion of late rows in each fold's fitting data as a constant predicted
+probability. Constant predictions have an AUC of 0.5. Precision, recall, and
+the proportion flagged help assess whether a model raises too many alerts.
+
+These are item-row metrics, so orders with more rows have more weight. Threshold
+and model selection used these same folds, so the selected CV results may be
+optimistic. Test columns remain empty until the final evaluation.
+
+```{r classification comparison}
+# Each validation fold receives the late rate learned from the other folds.
+prevalence_predictions <- map_dfr(1:k, function(fold_num) {
+  fitting_rate <- train_cv %>%
+    filter(fold != fold_num) %>%
+    summarise(rate = mean(as.character(Late_delivery_risk) == "1")) %>%
+    pull(rate)
+
+  train_cv %>%
+    filter(fold == fold_num) %>%
+    transmute(
+      fold = fold_num,
+      gold = as.character(Late_delivery_risk),
+      probability = fitting_rate
+    )
+})
+
+always_late_predictions <- prevalence_predictions %>%
+  mutate(probability = 1)
+
+# Keep one set of validation predictions for each selected configuration.
+selected_lasso_predictions <- lasso_cv_predictions %>%
+  filter(lambda == best_lasso$lambda)
+selected_rf_predictions <- rf_cv_preds %>%
+  filter(mtry == best_rf$mtry, min.node.size == best_rf$min.node.size)
+selected_boost_predictions <- boost_cv_predictions %>%
+  filter(depth == best_boost$depth, rate == best_boost$rate,
+         n_trees == best_boost$n_trees)
+
+comparison_metrics <- function(predictions, method) {
+  fold_metrics <- predictions %>%
+    group_by(fold) %>%
+    group_modify(function(.x, .y) {
+      score_fold(.x, threshold = set.threshold) %>%
+        select(precision, recall, f1, roc_auc) %>%
+        mutate(alert_rate = mean(.x$probability > set.threshold))
+    }) %>%
+    ungroup()
+
+  stopifnot(nrow(fold_metrics) == k, n_distinct(fold_metrics$fold) == k)
+
+  fold_metrics %>%
+    summarise(across(c(precision, recall, f1, roc_auc, alert_rate), mean)) %>%
+    mutate(method = method, .before = 1)
+}
+
+model_comparison <- bind_rows(
+  comparison_metrics(prevalence_predictions, "Training prevalence benchmark"),
+  comparison_metrics(always_late_predictions, "Always-late benchmark"),
+  comparison_metrics(cv_predictions, "Logistic regression"),
+  comparison_metrics(selected_lasso_predictions, "Lasso logistic regression"),
+  comparison_metrics(selected_rf_predictions, "Random forest"),
+  comparison_metrics(selected_boost_predictions, "Gradient boosting")
+) %>%
+  rename(
+    cv_auc_roc = roc_auc,
+    cv_f1 = f1,
+    cv_precision = precision,
+    cv_recall = recall,
+    cv_alert_rate = alert_rate
+  ) %>%
+  mutate(test_auc_roc = NA_real_, test_f1 = NA_real_) %>%
+  select(method, cv_auc_roc, cv_f1, cv_precision, cv_recall, cv_alert_rate,
+         test_auc_roc, test_f1)
+
+model_comparison
+```
 
 
 
